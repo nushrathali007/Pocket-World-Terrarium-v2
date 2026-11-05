@@ -7,6 +7,7 @@ export type SoundCueType = 'plant' | 'water' | 'harvest' | 'milestone' | 'build'
 export class AmbientSoundscape {
   private ctx: AudioContext | null = null;
   private isEnabled = false;
+  private volume = 0.32;
 
   private masterGain: GainNode | null = null;
   private windFilter: BiquadFilterNode | null = null;
@@ -16,7 +17,7 @@ export class AmbientSoundscape {
   private cricketGain: GainNode | null = null;
 
   private cricketInterval: number | null = null;
-  private currentWeather: WeatherMode = 'sunny';
+  private currentWeather: WeatherMode = 'clear';
   private currentTimeOfDay = 0.24;
   private currentTimeMode: TimeMode = 'auto';
 
@@ -50,12 +51,30 @@ export class AmbientSoundscape {
         this.currentTimeMode,
       );
       if (this.masterGain && this.ctx) {
-        this.masterGain.gain.setTargetAtTime(0.32, this.ctx.currentTime, 0.35);
+        this.masterGain.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.35);
       }
     } else if (this.masterGain && this.ctx) {
       this.masterGain.gain.setTargetAtTime(0.0001, this.ctx.currentTime, 0.25);
     }
     return this.isEnabled;
+  }
+
+  public setVolume(vol: number): void {
+    this.volume = Math.max(0.0001, Math.min(1, vol)) * 0.45;
+    if (this.isEnabled && this.masterGain && this.ctx) {
+      this.masterGain.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.2);
+    }
+  }
+
+  public update(
+    _dayFactor: number,
+    nightFactor: number,
+    isRaining: boolean,
+    isSnowing: boolean,
+  ): void {
+    const mode: WeatherMode = isSnowing ? 'snow' : isRaining ? 'rain' : 'clear';
+    const timeOfDay = nightFactor > 0.35 ? 0.72 : 0.25;
+    this.updateParameters(mode, timeOfDay, 'auto');
   }
 
   public getEnabled(): boolean {
@@ -71,7 +90,7 @@ export class AmbientSoundscape {
       this.ctx.resume();
     }
     if (this.masterGain && this.ctx) {
-      this.masterGain.gain.setTargetAtTime(0.32, this.ctx.currentTime, 0.35);
+      this.masterGain.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.35);
     }
   }
 
@@ -83,7 +102,6 @@ export class AmbientSoundscape {
     const now = this.ctx.currentTime;
 
     if (type === 'water') {
-      // Soft water droplet chime
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.type = 'sine';
@@ -97,7 +115,6 @@ export class AmbientSoundscape {
       osc.start(now);
       osc.stop(now + 0.2);
     } else if (type === 'plant' || type === 'build') {
-      // Warm wooden marimba-like pluck
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.type = 'triangle';
@@ -112,7 +129,6 @@ export class AmbientSoundscape {
       osc.start(now);
       osc.stop(now + 0.18);
     } else if (type === 'harvest') {
-      // Gentle two-note warm fifth chime
       const notes = [523.25, 659.25];
       notes.forEach((freq, i) => {
         if (!this.ctx || !this.masterGain) return;
@@ -130,7 +146,6 @@ export class AmbientSoundscape {
         osc.stop(start + 0.3);
       });
     } else if (type === 'milestone') {
-      // Peaceful major triad arpeggio
       const notes = [523.25, 659.25, 783.99, 1046.5];
       notes.forEach((freq, i) => {
         if (!this.ctx || !this.masterGain) return;
@@ -165,7 +180,6 @@ export class AmbientSoundscape {
     masterGain.connect(ctx.destination);
     this.masterGain = masterGain;
 
-    // Create 4-second looping pink-ish noise buffer for wind & rustling leaves
     const bufferSize = ctx.sampleRate * 4;
     const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
     const output = noiseBuffer.getChannelData(0);
@@ -188,7 +202,6 @@ export class AmbientSoundscape {
       b6 = white * 0.115926;
     }
 
-    // 1. Wind Layer (Lowpass/Bandpass filtered noise + slow LFO sweep)
     const windSource = ctx.createBufferSource();
     windSource.buffer = noiseBuffer;
     windSource.loop = true;
@@ -200,7 +213,7 @@ export class AmbientSoundscape {
 
     const windLfo = ctx.createOscillator();
     windLfo.type = 'sine';
-    windLfo.frequency.value = 0.14; // Gentle 7-second gust cycle
+    windLfo.frequency.value = 0.14;
     const windLfoGain = ctx.createGain();
     windLfoGain.gain.value = 140;
     windLfo.connect(windLfoGain);
@@ -219,7 +232,6 @@ export class AmbientSoundscape {
     this.windFilter = windFilter;
     this.windGain = windGain;
 
-    // 2. Rustling Leaves / Rain Patter Layer (Higher bandpass noise + subtle flutter LFO)
     const leavesSource = ctx.createBufferSource();
     leavesSource.buffer = noiseBuffer;
     leavesSource.loop = true;
@@ -250,7 +262,6 @@ export class AmbientSoundscape {
     this.leavesFilter = leavesFilter;
     this.leavesGain = leavesGain;
 
-    // 3. Night Crickets Layer (Periodic dual-tone high chirps)
     const cricketGain = ctx.createGain();
     cricketGain.gain.value = 0.0;
     cricketGain.connect(masterGain);
@@ -316,14 +327,12 @@ export class AmbientSoundscape {
 
     const now = this.ctx.currentTime;
 
-    // Determine if night/twilight
     const isNight =
       timeMode === 'night' ||
       timeMode === 'twilight' ||
       (timeMode === 'auto' && (timeOfDay > 0.52 || timeOfDay < 0.06));
 
     if (weather === 'snow') {
-      // Winter wind: deeper, hollow whistling wind, minimal leaf rustle, no crickets
       this.windFilter.frequency.setTargetAtTime(480, now, 0.8);
       this.windFilter.Q.setTargetAtTime(4.2, now, 0.8);
       this.windGain.gain.setTargetAtTime(0.45, now, 0.8);
@@ -333,7 +342,6 @@ export class AmbientSoundscape {
 
       this.cricketGain.gain.setTargetAtTime(0.0, now, 0.5);
     } else if (weather === 'rain') {
-      // Rain & breeze: fuller rain patter in mid-high frequencies + soft wind, muted crickets
       this.windFilter.frequency.setTargetAtTime(340, now, 0.8);
       this.windFilter.Q.setTargetAtTime(1.8, now, 0.8);
       this.windGain.gain.setTargetAtTime(0.32, now, 0.8);
@@ -344,7 +352,6 @@ export class AmbientSoundscape {
 
       this.cricketGain.gain.setTargetAtTime(0.0, now, 0.5);
     } else {
-      // Sunny / Clear: gentle breeze + rustling leaves in day, crickets at night
       this.windFilter.frequency.setTargetAtTime(260, now, 0.8);
       this.windFilter.Q.setTargetAtTime(2.2, now, 0.8);
       this.windGain.gain.setTargetAtTime(isNight ? 0.16 : 0.24, now, 0.8);

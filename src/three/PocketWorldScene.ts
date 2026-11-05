@@ -1,18 +1,46 @@
 import * as THREE from 'three';
 import {
+  BUILDING_COSTS,
+  computePlotLifecycleState,
+  CROP_CONFIGS,
+  isPlotRipe,
+  MILESTONE_DEFINITIONS,
+  PlotLifecycleState,
+  PRODUCTION_CONFIG,
+  PROGRESSION_TIERS,
+  ProgressionTierId,
+  SEASON_DURATION_SEC,
+  SeasonId,
+  SEASONS_ORDER,
+  WEATHER_PHASE_DURATIONS,
+  WeatherPhase,
+} from '../config/farmConfig';
+import {
   CameraViewId,
   CropType,
   HarvestFeedbackBatch,
   SelectedEntityInfo,
   TimeMode,
+  TOOL_DEFINITIONS,
   ToolId,
   VillagerAssignment,
   VillagerRole,
+  WeatherMode,
   WeatherSummary,
   WorldState,
 } from '../types/world';
+import { AmbientSoundscape } from '../utils/ambientAudio';
+import {
+  clearWorldStorage,
+  loadWorldFromStorage,
+  SAVE_VERSION,
+  saveWorldToStorage,
+  SerializedWorldSaveV2,
+  validateWorldSave,
+} from '../utils/saveSystem';
 import { soundEngine } from '../utils/sound';
 import { createRoomEnvTexture } from '../utils/textures';
+import { QuietPixelEffectsCoordinator } from './QuietPixelEffects';
 import {
   BalloonEntity,
   CloudEntity,
@@ -96,15 +124,35 @@ interface SparkleBurst {
   maxAge: number;
 }
 
+const IS_SOFTWARE_GL = (() => {
+  try {
+    const probeCanvas = document.createElement('canvas');
+    const gl = (probeCanvas.getContext('webgl2') ||
+      probeCanvas.getContext('webgl') ||
+      probeCanvas.getContext('experimental-webgl')) as WebGLRenderingContext | null;
+    if (!gl) return true;
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+    const gpu = String(gl.getParameter(param));
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+    return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+  } catch {
+    return true;
+  }
+})();
+
 export class PocketWorldController {
   private container: HTMLElement;
   private onStateChange: (updater: (prev: WorldState) => WorldState) => void;
   private onHarvestFeedback?: (batch: Partial<HarvestFeedbackBatch>) => void;
 
-  private renderer!: THREE.WebGLRenderer;
+  private renderer: THREE.WebGLRenderer | null = null;
+  private fallbackCanvas: HTMLCanvasElement | null = null;
+  private isSoftwareGl = IS_SOFTWARE_GL;
   private scene!: THREE.Scene;
   private camera!: THREE.PerspectiveCamera;
   private animFrameId: number | null = null;
+  private timerFrameId: number | null = null;
   private clock = new THREE.Clock();
 
   private roomEnv!: ReturnType<typeof createRoomEnvironment>;
@@ -153,15 +201,43 @@ export class PocketWorldController {
   private selectedEntityId: string | null = null;
   private lastSelectionSyncTime = 0;
 
-  // Resources, Inventory & Activity Counters
+  // Resources, Inventory, Economy, Progression & Activity Counters
+  private planetName = 'Little Meadow';
+  private coins = 32;
+  private gardenPoints = 6;
+  private seedsByCrop: Record<CropType, number> = {
+    berry: 5,
+    wheat: 5,
+    pumpkin: 2,
+  };
+  private discoveredCrops = new Set<CropType>(['berry', 'wheat']);
+  private completedMilestones = new Set<string>();
+  private autoReplantEnabled = false;
+  private statusMessage: string | null = null;
+  private statusMessageTimer: number | null = null;
+  private lastSavedAt: number | null = null;
+  private autosaveTimer = 24;
+  private isTabHidden = false;
+
+  // Shared Weather & Season Controller
+  private season: SeasonId = 'spring';
+  private seasonTimer = 0;
+  private weatherPhase: WeatherPhase = 'clear';
+  private weatherTimer = WEATHER_PHASE_DURATIONS.clear;
+  private weatherOverride: WeatherPhase | null = null;
+
+  // PixelFX Coordinator & Procedural Ambient Soundscape
+  private pixelFx!: QuietPixelEffectsCoordinator;
+  private ambientAudio = new AmbientSoundscape();
+
   private resources = {
-    seeds: 14,
+    seeds: 12,
     water: 18,
-    compost: 8,
+    compost: 4,
     harvestTotal: 6,
   };
   private inventory = {
-    wheat: 3,
+    wheat: 2,
     pumpkin: 1,
     berry: 2,
     honey: 1,
@@ -187,8 +263,8 @@ export class PocketWorldController {
   private lastPointerPos = new THREE.Vector2();
   private angularVelocity = new THREE.Vector2(0.0, 0.0);
 
-  // Initial 3-second 360-degree intro spin state
-  private introSpinActive = true;
+  // Disabled forced 3-second intro spin by default so camera starts still and ready for play
+  private introSpinActive = false;
   private introSpinElapsed = 0;
 
   // Camera choreography
@@ -222,7 +298,17 @@ export class PocketWorldController {
       this.introSpinActive = false;
     }
     this.initScene();
-    this.populateInitialWorld();
+    this.pixelFx = new QuietPixelEffectsCoordinator(
+      this.planetRoot,
+      this.terrain.baseRadius,
+    );
+    const saved = loadWorldFromStorage();
+    if (saved) {
+      this.restoreFromSerializedSave(saved);
+    } else {
+      this.populateInitialWorld();
+    }
+    this.syncCanopyEmitters();
     this.bindEvents();
     this.syncWorldStats();
     this.animate();
@@ -232,20 +318,51 @@ export class PocketWorldController {
     const width = this.container.clientWidth || window.innerWidth;
     const height = this.container.clientHeight || window.innerHeight;
 
-    this.renderer = new THREE.WebGLRenderer({
-      antialias: true,
-      powerPreference: 'high-performance',
-    });
-    this.renderer.setSize(width, height);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.08;
     while (this.container.firstChild) {
       this.container.removeChild(this.container.firstChild);
     }
-    this.container.appendChild(this.renderer.domElement);
+
+    let createdRenderer: THREE.WebGLRenderer | null = null;
+    try {
+      createdRenderer = new THREE.WebGLRenderer({
+        antialias: !this.isSoftwareGl,
+        powerPreference: this.isSoftwareGl ? 'default' : 'high-performance',
+      });
+    } catch {
+      try {
+        createdRenderer = new THREE.WebGLRenderer({
+          antialias: false,
+          powerPreference: 'default',
+          failIfMajorPerformanceCaveat: false,
+        });
+      } catch {
+        createdRenderer = null;
+      }
+    }
+
+    this.renderer = createdRenderer;
+
+    if (this.renderer) {
+      this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+      this.renderer.setSize(width, height);
+      this.renderer.setPixelRatio(
+        this.isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2),
+      );
+      this.renderer.shadowMap.enabled = !this.isSoftwareGl;
+      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      this.renderer.toneMappingExposure = 1.08;
+      this.container.appendChild(this.renderer.domElement);
+    } else {
+      const fbCanvas = document.createElement('canvas');
+      fbCanvas.width = width;
+      fbCanvas.height = height;
+      fbCanvas.style.width = `${width}px`;
+      fbCanvas.style.height = `${height}px`;
+      fbCanvas.style.display = 'block';
+      this.fallbackCanvas = fbCanvas;
+      this.container.appendChild(fbCanvas);
+    }
 
     this.scene = new THREE.Scene();
 
@@ -270,8 +387,11 @@ export class PocketWorldController {
 
     this.roomWindowLight = new THREE.DirectionalLight('#ffdfb8', 1.35);
     this.roomWindowLight.position.set(-4.8, 4.6, 3.8);
-    this.roomWindowLight.castShadow = true;
-    this.roomWindowLight.shadow.mapSize.set(2048, 2048);
+    this.roomWindowLight.castShadow = !this.isSoftwareGl;
+    this.roomWindowLight.shadow.mapSize.set(
+      this.isSoftwareGl ? 512 : 2048,
+      this.isSoftwareGl ? 512 : 2048,
+    );
     this.roomWindowLight.shadow.camera.near = 1.0;
     this.roomWindowLight.shadow.camera.far = 15.0;
     const d = 3.2;
@@ -396,8 +516,11 @@ export class PocketWorldController {
 
     // Little sun directional light casting moving shadows across the planet
     this.sunLight = new THREE.DirectionalLight('#fff0c2', 1.9);
-    this.sunLight.castShadow = true;
-    this.sunLight.shadow.mapSize.set(1024, 1024);
+    this.sunLight.castShadow = !this.isSoftwareGl;
+    this.sunLight.shadow.mapSize.set(
+      this.isSoftwareGl ? 512 : 1024,
+      this.isSoftwareGl ? 512 : 1024,
+    );
     this.sunLight.shadow.camera.near = 0.2;
     this.sunLight.shadow.camera.far = 3.5;
     const sd = 1.05;
@@ -782,13 +905,15 @@ export class PocketWorldController {
       this.spawnCloud(d, false, idx === 0 ? 3.5 : 8.0 + idx * 4.0, false);
     });
 
-    // 16. Six Cultivated Garden Plots near the Village & Windmill (some ripe, some growing)
+    // 16. Six Cultivated Garden Plots near the Village & Windmill (spanning lifecycle states)
     const initialPlots: {
       dir: THREE.Vector3;
       cropType: CropType;
       growth: number;
       moisture: number;
       composted: boolean;
+      hasCrop: boolean;
+      harvested: boolean;
     }[] = [
       {
         dir: new THREE.Vector3(-0.44, 0.24, 0.86).normalize(),
@@ -796,41 +921,53 @@ export class PocketWorldController {
         growth: 1.0,
         moisture: 0.85,
         composted: true,
+        hasCrop: true,
+        harvested: false,
       },
       {
         dir: new THREE.Vector3(-0.46, 0.16, 0.87).normalize(),
         cropType: 'wheat',
-        growth: 0.65,
+        growth: 0.62,
         moisture: 0.72,
         composted: false,
+        hasCrop: true,
+        harvested: false,
       },
       {
         dir: new THREE.Vector3(-0.24, 0.14, 0.96).normalize(),
-        cropType: 'pumpkin',
+        cropType: 'berry',
         growth: 1.0,
-        moisture: 0.9,
+        moisture: 0.88,
         composted: true,
+        hasCrop: true,
+        harvested: false,
       },
       {
         dir: new THREE.Vector3(-0.08, 0.28, 0.95).normalize(),
         cropType: 'berry',
-        growth: 1.0,
-        moisture: 0.8,
+        growth: 0.28,
+        moisture: 0.58,
         composted: false,
+        hasCrop: true,
+        harvested: false,
       },
       {
         dir: new THREE.Vector3(-0.18, 0.36, 0.91).normalize(),
-        cropType: 'berry',
-        growth: 0.55,
-        moisture: 0.6,
+        cropType: 'pumpkin',
+        growth: 0.52,
+        moisture: 0.64,
         composted: true,
+        hasCrop: true,
+        harvested: false,
       },
       {
         dir: new THREE.Vector3(0.02, 0.22, 0.97).normalize(),
-        cropType: 'pumpkin',
-        growth: 0.48,
-        moisture: 0.5,
+        cropType: 'berry',
+        growth: 0.0,
+        moisture: 0.65,
         composted: false,
+        hasCrop: false,
+        harvested: false,
       },
     ];
 
@@ -843,6 +980,10 @@ export class PocketWorldController {
         p.moisture,
         p.composted,
         false,
+        {
+          hasCrop: p.hasCrop,
+          harvested: p.harvested,
+        },
       );
       this.updatePlotVisuals(plotObj);
     });
@@ -1210,6 +1351,9 @@ export class PocketWorldController {
       targetGrowth: initialGrowth,
       bounceTime: withSparkles ? 0.0 : 10.0,
       bounceActive: withSparkles,
+      isProcessing: false,
+      productionTimer: 0,
+      storedOutput: type === 'beehive' ? 1 : 0,
       windmillRotor,
       lighthouseBeamPivot,
       lighthouseConeMats,
@@ -1231,6 +1375,9 @@ export class PocketWorldController {
     }
 
     this.placedObjects.push(entity);
+    if (type === 'oak') {
+      this.syncCanopyEmitters();
+    }
     return entity;
   }
 
@@ -1238,28 +1385,41 @@ export class PocketWorldController {
     cropType: CropType,
     dir: THREE.Vector3,
     yaw = 0,
-    initialGrowth = 0.28,
+    initialGrowth = 0.04,
     initialMoisture = 0.78,
     composted = false,
     withSparkles = true,
+    options?: {
+      id?: string;
+      hasCrop?: boolean;
+      harvested?: boolean;
+      hasCloche?: boolean;
+    },
   ): PlacedObjectEntity {
     const normDir = dir.clone().normalize();
     const { group, parts } = createGardenPlotMesh(cropType);
     this.orientObjectOnSurface(group, normDir, yaw, 0, false, false);
     this.objectsGroup.add(group);
 
+    const hasCrop = options?.hasCrop ?? true;
+    const harvested = options?.harvested ?? false;
+
     const entity: PlacedObjectEntity = {
-      id: `plot_${cropType}_${Date.now()}_${Math.random()}`,
+      id: options?.id || `plot_${cropType}_${Date.now()}_${Math.random()}`,
       type: 'plot',
       dir: normDir,
       yaw,
       mesh: group,
       baseScale: 1.0,
-      growth: initialGrowth,
+      growth: hasCrop ? initialGrowth : 0.0,
       targetGrowth: 1.0,
       bounceTime: withSparkles && !this.reducedMotion ? 0.0 : 10.0,
       bounceActive: withSparkles && !this.reducedMotion,
       cropType,
+      hasCrop,
+      harvested,
+      hasCloche: Boolean(options?.hasCloche),
+      reservedByVillagerId: null,
       moisture: initialMoisture,
       composted,
       plotParts: parts,
@@ -1275,26 +1435,73 @@ export class PocketWorldController {
     return entity;
   }
 
+  private getPlotLifecycle(plot: PlacedObjectEntity): PlotLifecycleState {
+    return computePlotLifecycleState(
+      plot.hasCrop ?? true,
+      Boolean(plot.harvested),
+      plot.growth,
+    );
+  }
+
   private updatePlotVisuals(plot: PlacedObjectEntity) {
     if (plot.type !== 'plot' || !plot.plotParts) return;
-    const { soilMat, compostGroup, sproutsGroup, matureGroup } = plot.plotParts;
-    const moisture = plot.moisture ?? 0.5;
-    // Darker rich soil when well-hydrated, lighter brown when dry
-    soilMat.color.setHSL(0.07, 0.36, THREE.MathUtils.lerp(0.32, 0.17, moisture));
+    const {
+      soilMat,
+      compostGroup,
+      seedDotsGroup,
+      sproutsGroup,
+      matureGroup,
+      harvestedStubbleGroup,
+      clocheGroup,
+    } = plot.plotParts;
+
+    const moisture = THREE.MathUtils.clamp(plot.moisture ?? 0.5, 0, 1);
+    // Darker rich loam when well-hydrated, lighter warm soil when dry
+    soilMat.color.setHSL(0.07, 0.36, THREE.MathUtils.lerp(0.33, 0.16, moisture));
     compostGroup.visible = Boolean(plot.composted);
+    clocheGroup.visible = Boolean(plot.hasCloche);
 
-    const g = THREE.MathUtils.clamp(plot.growth, 0.15, 1.0);
-    // Sprouts visible early on and settle into base foliage
-    const sproutScale = THREE.MathUtils.clamp(g * 1.35, 0.35, 1.0);
-    sproutsGroup.scale.setScalar(sproutScale);
+    const state = this.getPlotLifecycle(plot);
+    const g = THREE.MathUtils.clamp(plot.growth, 0, 1);
 
-    // Mature crop emerges above 45% growth and reaches full stature at 100%
-    if (g < 0.42) {
+    if (state === 'prepared') {
+      seedDotsGroup.visible = false;
+      sproutsGroup.visible = false;
       matureGroup.visible = false;
-    } else {
+      harvestedStubbleGroup.visible = false;
+    } else if (state === 'harvested') {
+      seedDotsGroup.visible = false;
+      sproutsGroup.visible = false;
+      matureGroup.visible = false;
+      harvestedStubbleGroup.visible = true;
+    } else if (state === 'sown') {
+      seedDotsGroup.visible = true;
+      sproutsGroup.visible = false;
+      matureGroup.visible = false;
+      harvestedStubbleGroup.visible = false;
+    } else if (state === 'seedling') {
+      seedDotsGroup.visible = false;
+      sproutsGroup.visible = true;
+      const t = THREE.MathUtils.clamp((g - 0.12) / 0.3, 0, 1);
+      sproutsGroup.scale.setScalar(0.38 + t * 0.62);
+      matureGroup.visible = false;
+      harvestedStubbleGroup.visible = false;
+    } else if (state === 'growing') {
+      seedDotsGroup.visible = false;
+      sproutsGroup.visible = true;
+      sproutsGroup.scale.setScalar(1.0);
       matureGroup.visible = true;
-      const matScale = THREE.MathUtils.clamp((g - 0.4) / 0.6, 0.15, 1.05);
-      matureGroup.scale.setScalar(matScale);
+      const t = THREE.MathUtils.clamp((g - 0.42) / 0.575, 0, 1);
+      matureGroup.scale.setScalar(0.18 + t * 0.76);
+      harvestedStubbleGroup.visible = false;
+    } else {
+      // 'ripe'
+      seedDotsGroup.visible = false;
+      sproutsGroup.visible = true;
+      sproutsGroup.scale.setScalar(1.0);
+      matureGroup.visible = true;
+      matureGroup.scale.setScalar(1.05);
+      harvestedStubbleGroup.visible = false;
     }
   }
 
@@ -1820,6 +2027,74 @@ export class PocketWorldController {
     }
   }
 
+  private showStatusMessage(msg: string, durationMs = 3400) {
+    this.statusMessage = msg;
+    if (this.statusMessageTimer !== null) {
+      window.clearTimeout(this.statusMessageTimer);
+    }
+    this.onStateChange((prev) => ({ ...prev, statusMessage: msg }));
+    this.statusMessageTimer = window.setTimeout(() => {
+      this.statusMessage = null;
+      this.statusMessageTimer = null;
+      this.onStateChange((prev) => ({ ...prev, statusMessage: null }));
+    }, durationMs);
+  }
+
+  public getCurrentProgressionTier(): ProgressionTierId {
+    let current: ProgressionTierId = 'first_sprouts';
+    for (const tier of PROGRESSION_TIERS) {
+      if (this.gardenPoints >= tier.requiredPoints) {
+        current = tier.id;
+      }
+    }
+    return current;
+  }
+
+  public isTierUnlocked(requiredTier?: ProgressionTierId): boolean {
+    if (!requiredTier) return true;
+    const order: ProgressionTierId[] = [
+      'first_sprouts',
+      'kitchen_garden',
+      'village_farm',
+      'flourishing_terrarium',
+    ];
+    const curIdx = order.indexOf(this.getCurrentProgressionTier());
+    const reqIdx = order.indexOf(requiredTier);
+    return curIdx >= reqIdx;
+  }
+
+  public isToolUnlocked(toolId: ToolId): boolean {
+    const def = TOOL_DEFINITIONS.find((t) => t.id === toolId);
+    if (!def || !def.requiredTier) return true;
+    return this.isTierUnlocked(def.requiredTier);
+  }
+
+  private spendCoins(amount: number, reasonLabel: string): boolean {
+    if (amount <= 0) return true;
+    if (this.coins < amount) {
+      this.showStatusMessage(
+        `Need ${amount} Coins for ${reasonLabel} (have ${this.coins} Coins)`,
+      );
+      return false;
+    }
+    this.coins -= amount;
+    return true;
+  }
+
+  private syncCanopyEmitters() {
+    if (!this.pixelFx) return;
+    const oakAnchors: THREE.Vector3[] = [];
+    for (const obj of this.placedObjects) {
+      if (obj.type === 'oak') {
+        const surf = this.terrain.getSurfacePointAndNormal(obj.dir);
+        oakAnchors.push(
+          surf.point.clone().addScaledVector(surf.normal, 0.055),
+        );
+      }
+    }
+    this.pixelFx.syncTreeCanopies(oakAnchors);
+  }
+
   public handleSurfaceAction(localDir: THREE.Vector3) {
     const surface = this.terrain.getSurfacePointAndNormal(localDir);
     const tool = this.activeTool;
@@ -1830,7 +2105,60 @@ export class PocketWorldController {
       return;
     }
 
-    // 1. PLANT Seeds (Wheat, Pumpkin, Berry)
+    if (!this.isToolUnlocked(tool)) {
+      const def = TOOL_DEFINITIONS.find((t) => t.id === tool);
+      const tierInfo = PROGRESSION_TIERS.find(
+        (tr) => tr.id === def?.requiredTier,
+      );
+      this.showStatusMessage(
+        `Unlocks at ${tierInfo?.label || 'next tier'} (${tierInfo?.requiredPoints || 0} Garden Points)`,
+      );
+      return;
+    }
+
+    // 1A. PREPARE SOIL BED
+    if (tool === 'prepare_bed') {
+      if (surface.isWater || surface.isMountain || surface.normal.dot(localDir) < 0.78) {
+        this.showStatusMessage(
+          'Choose a gentle, dry meadow spot to prepare a soil bed',
+        );
+        return;
+      }
+      const existingPlot = this.findNearestPlot(localDir, 0.088);
+      if (existingPlot) {
+        this.selectedEntityId = existingPlot.id;
+        this.showStatusMessage('A garden bed is already prepared here');
+        this.syncWorldStats();
+        return;
+      }
+      if (!this.isPositionClearOfObstacles(localDir, 0.024)) {
+        this.showStatusMessage('Clear a little more room around buildings and trees');
+        return;
+      }
+      const cost = BUILDING_COSTS.prepare_bed || 4;
+      if (!this.spendCoins(cost, 'preparing a soil bed')) {
+        return;
+      }
+      this.terrain.tillAtDirection(localDir, 0.055);
+      const yaw = this.computeYawFacingTarget(localDir, this.wellDirection);
+      const newPlot = this.placeGardenPlot(
+        'berry',
+        localDir,
+        yaw,
+        0.0,
+        0.62,
+        false,
+        true,
+        { hasCrop: false, harvested: false },
+      );
+      soundEngine.playPlant();
+      this.selectedEntityId = newPlot.id;
+      this.showStatusMessage('Prepared a fresh soil bed — select seeds to sow');
+      this.syncWorldStats();
+      return;
+    }
+
+    // 1B. PLANT / SOW Seeds (Wheat, Pumpkin, Berry)
     if (
       tool === 'wheat_seed' ||
       tool === 'pumpkin_seed' ||
@@ -1843,28 +2171,58 @@ export class PocketWorldController {
             ? 'pumpkin'
             : 'berry';
 
-      // Check if clicking directly on an existing plot to replant it
-      const existingPlot = this.findNearestPlot(localDir, 0.085);
+      const cropCfg = CROP_CONFIGS[cropType];
+      if (!this.isTierUnlocked(cropCfg.unlockTier)) {
+        this.showStatusMessage(`${cropCfg.label} unlocks at Kitchen Garden tier`);
+        return;
+      }
+
+      // Check if clicking on an existing plot to sow or replant it
+      const existingPlot = this.findNearestPlot(localDir, 0.095);
       if (existingPlot) {
         this.replantPlot(existingPlot.id, cropType);
         return;
       }
 
-      if (surface.isWater) {
-        this.terrain.sculptAtDirection(localDir, 'raise');
-        this.realignAllObjectsToTerrain();
+      // Do not automatically raise water when sowing seeds!
+      if (surface.isWater || surface.isMountain || surface.normal.dot(localDir) < 0.78) {
+        this.showStatusMessage(
+          'Seeds need dry, level ground or a prepared soil bed',
+        );
+        return;
       }
+      if (!this.isPositionClearOfObstacles(localDir, 0.024)) {
+        this.showStatusMessage('Not enough space between nearby structures');
+        return;
+      }
+
+      if ((this.seedsByCrop[cropType] || 0) < 1) {
+        this.showStatusMessage(
+          `No ${cropCfg.label} seeds left — buy seeds in the Inventory menu`,
+        );
+        return;
+      }
+
+      // Preparing a new bed + sowing on open ground costs bed preparation coins (unless player has 0 plots)
+      const plotCount = this.placedObjects.filter((o) => o.type === 'plot').length;
+      const bedCost = plotCount === 0 ? 0 : BUILDING_COSTS.prepare_bed || 4;
+      if (bedCost > 0 && !this.spendCoins(bedCost, 'new garden bed')) {
+        return;
+      }
+
+      this.seedsByCrop[cropType] -= 1;
+      this.terrain.tillAtDirection(localDir, 0.055);
       const yaw = this.computeYawFacingTarget(localDir, this.wellDirection);
       const newPlot = this.placeGardenPlot(
         cropType,
         localDir,
         yaw,
-        0.32,
-        0.82,
+        0.02, // Starts in 'sown' stage
+        0.58,
         false,
         true,
+        { hasCrop: true, harvested: false },
       );
-      this.resources.seeds = Math.max(0, this.resources.seeds - 1);
       this.stats.totalPlanted += 1;
       soundEngine.playPlant();
       this.selectedEntityId = newPlot.id;
@@ -1872,66 +2230,67 @@ export class PocketWorldController {
       return;
     }
 
-    // 2. TEND tools: Watering Can & Rich Compost
+    // 2. TEND tools: Watering Can, Rich Compost & Glass Cloche
     if (tool === 'water_can') {
-      const targetPlot = this.findNearestPlot(localDir, 0.16);
+      const targetPlot = this.findNearestPlot(localDir, 0.15);
       if (targetPlot) {
         this.waterPlot(targetPlot.id);
-      } else {
-        // Also nourish nearby trees and terrain
-        this.terrain.applyRainAtDirection(localDir, 0.45);
-        for (const obj of this.placedObjects) {
-          if (
-            (obj.type === 'oak' || obj.type === 'pine' || obj.type === 'palm') &&
-            obj.dir.distanceTo(localDir) < 0.22
-          ) {
-            obj.targetGrowth = Math.min(1.42, obj.targetGrowth + 0.18);
-            obj.bounceTime = 0;
-            obj.bounceActive = !this.reducedMotion;
-          }
-        }
-        this.emitSparklesAtDir(localDir, '#7ed6ff');
-        soundEngine.playWater();
-        this.stats.totalTended += 1;
-        this.syncWorldStats();
+        return;
       }
+      if (this.resources.water < 1) {
+        this.showStatusMessage(
+          'Watering can is empty — refill at the Stone Well',
+        );
+        return;
+      }
+      this.resources.water -= 1;
+      this.terrain.applyRainAtDirection(localDir, 0.45);
+      this.pixelFx.spawnRipple(surface.point, surface.normal, 'soil');
+      for (const obj of this.placedObjects) {
+        if (
+          (obj.type === 'oak' || obj.type === 'pine' || obj.type === 'palm') &&
+          obj.dir.distanceTo(localDir) < 0.22
+        ) {
+          obj.targetGrowth = Math.min(1.38, obj.targetGrowth + 0.12);
+          obj.bounceTime = 0;
+          obj.bounceActive = !this.reducedMotion;
+        }
+      }
+      soundEngine.playWater();
+      this.stats.totalTended += 1;
+      this.syncWorldStats();
       return;
     }
 
     if (tool === 'compost') {
-      const targetPlot = this.findNearestPlot(localDir, 0.16);
+      const targetPlot = this.findNearestPlot(localDir, 0.15);
       if (targetPlot) {
         this.compostPlot(targetPlot.id);
       } else {
-        for (const obj of this.placedObjects) {
-          if (
-            (obj.type === 'oak' ||
-              obj.type === 'pine' ||
-              obj.type === 'palm' ||
-              obj.type === 'flower') &&
-            obj.dir.distanceTo(localDir) < 0.22
-          ) {
-            obj.targetGrowth = Math.min(1.45, obj.targetGrowth + 0.22);
-            obj.bounceTime = 0;
-            obj.bounceActive = !this.reducedMotion;
-          }
-        }
-        this.emitSparklesAtDir(localDir, '#e8c26b');
-        soundEngine.playPlant();
-        this.stats.totalTended += 1;
-        this.syncWorldStats();
+        this.showStatusMessage('Click directly on a garden bed to enrich its soil');
+      }
+      return;
+    }
+
+    if (tool === 'greenhouse_bell') {
+      const targetPlot = this.findNearestPlot(localDir, 0.15);
+      if (targetPlot) {
+        this.installClocheOnPlot(targetPlot.id);
+      } else {
+        this.showStatusMessage(
+          'Click a garden bed to fit a protective glass cloche over it',
+        );
       }
       return;
     }
 
     // 3. HARVEST tools: Harvest Basket & Gather All
     if (tool === 'harvest_basket') {
-      const targetPlot = this.findNearestPlot(localDir, 0.16);
+      const targetPlot = this.findNearestPlot(localDir, 0.15);
       if (targetPlot) {
         this.harvestPlot(targetPlot.id);
         return;
       }
-      // Check if clicking near a beehive to gather honey
       const hive = this.placedObjects.find(
         (o) => o.type === 'beehive' && o.dir.distanceTo(localDir) < 0.15,
       );
@@ -1939,6 +2298,14 @@ export class PocketWorldController {
         this.performBuildingAction(hive.id);
         return;
       }
+      const mill = this.placedObjects.find(
+        (o) => o.type === 'windmill' && o.dir.distanceTo(localDir) < 0.15,
+      );
+      if (mill) {
+        this.performBuildingAction(mill.id);
+        return;
+      }
+      this.showStatusMessage('Click a ripe crop plot, beehive, or windmill to collect');
       return;
     }
 
@@ -1948,6 +2315,10 @@ export class PocketWorldController {
     }
 
     if (tool === 'raise' || tool === 'lower' || tool === 'mountain' || tool === 'lake') {
+      const cost = BUILDING_COSTS[tool] || 0;
+      if (cost > 0 && !this.spendCoins(cost, 'terrain shaping')) {
+        return;
+      }
       this.terrain.sculptAtDirection(localDir, tool);
       this.realignAllObjectsToTerrain();
       this.emitSparklesAtDir(
@@ -1960,9 +2331,8 @@ export class PocketWorldController {
     }
 
     if (tool === 'remove') {
-      // Find closest removable placed object, sailboat, duck, balloon, or cloud
       let bestIdx = -1;
-      let bestDist = 0.16;
+      let bestDist = 0.15;
       for (let i = 0; i < this.placedObjects.length; i++) {
         const o = this.placedObjects[i];
         if (!o.removable) continue;
@@ -1979,40 +2349,20 @@ export class PocketWorldController {
           this.selectedEntityId = null;
           this.selectionRing.visible = false;
         }
+        if (removed.type === 'oak') {
+          this.syncCanopyEmitters();
+        }
         this.emitSparklesAtDir(removed.dir, '#ffb8b8');
         soundEngine.playSelect();
         this.syncWorldStats();
         return;
       }
 
-      // Check sailboats
       for (let i = 0; i < this.sailboats.length; i++) {
         if (this.sailboats[i].dir.distanceTo(localDir) < 0.18) {
           const removed = this.sailboats.splice(i, 1)[0];
           this.inhabitantsGroup.remove(removed.mesh);
           this.emitSparklesAtDir(removed.dir, '#ffb8b8', this.terrain.seaLevel);
-          this.syncWorldStats();
-          return;
-        }
-      }
-
-      // Check ducks
-      for (let i = 0; i < this.ducks.length; i++) {
-        if (this.ducks[i].dir.distanceTo(localDir) < 0.18) {
-          const removed = this.ducks.splice(i, 1)[0];
-          this.inhabitantsGroup.remove(removed.mesh);
-          this.emitSparklesAtDir(removed.dir, '#ffb8b8', this.terrain.seaLevel);
-          this.syncWorldStats();
-          return;
-        }
-      }
-
-      // Check balloons
-      for (let i = 0; i < this.balloons.length; i++) {
-        if (this.balloons[i].currentDir.distanceTo(localDir) < 0.24) {
-          const removed = this.balloons.splice(i, 1)[0];
-          this.atmosphereGroup.remove(removed.mesh);
-          this.emitSparklesAtDir(removed.currentDir, '#ffb8b8', removed.baseAltitude);
           this.syncWorldStats();
           return;
         }
@@ -2024,7 +2374,6 @@ export class PocketWorldController {
     if (tool === 'cloud') {
       this.spawnCloud(localDir, true, 1.0, false);
       soundEngine.playWater();
-      this.stats.totalTended += 1;
       this.syncWorldStats();
       return;
     }
@@ -2048,13 +2397,7 @@ export class PocketWorldController {
     }
     if (tool === 'rainbow') {
       const yaw = this.findCollisionFreeRainbowYaw(localDir);
-      this.placeStaticObject(
-        'rainbow',
-        localDir,
-        yaw,
-        true,
-        true,
-      );
+      this.placeStaticObject('rainbow', localDir, yaw, true, true);
       soundEngine.playHarvest();
       this.syncWorldStats();
       return;
@@ -2062,7 +2405,14 @@ export class PocketWorldController {
 
     // Water & Coastal tools
     if (tool === 'sailboat') {
+      const cost = BUILDING_COSTS.sailboat || 16;
+      if (!this.spendCoins(cost, 'Wooden Sailboat')) return;
       this.spawnSailboat(localDir, true);
+      const boat = this.sailboats[this.sailboats.length - 1];
+      if (boat) {
+        const boatPt = boat.dir.clone().multiplyScalar(this.terrain.seaLevel);
+        this.pixelFx.spawnRipple(boatPt, boat.dir, 'boat');
+      }
       soundEngine.playBuild();
       this.syncWorldStats();
       return;
@@ -2074,6 +2424,8 @@ export class PocketWorldController {
       return;
     }
     if (tool === 'dock') {
+      const cost = BUILDING_COSTS.dock || 24;
+      if (!this.spendCoins(cost, 'Timber Pier')) return;
       if (surface.isWater) {
         this.placeStaticObject(
           'bridge',
@@ -2100,18 +2452,29 @@ export class PocketWorldController {
       return;
     }
 
-    // Ensure dry land for land-based items
-    if (surface.isWater) {
-      this.terrain.sculptAtDirection(localDir, 'raise');
-      this.realignAllObjectsToTerrain();
+    // Validate dry land for land-based structures & trees
+    if (surface.isWater || surface.isMountain) {
+      this.showStatusMessage('Place land structures on dry meadow or hillside');
+      return;
+    }
+    if (!this.isPositionClearOfObstacles(localDir, 0.02)) {
+      this.showStatusMessage('Too close to an existing structure or tree');
+      return;
+    }
+
+    const toolCost = BUILDING_COSTS[tool] || 0;
+    if (toolCost > 0) {
+      const def = TOOL_DEFINITIONS.find((t) => t.id === tool);
+      if (!this.spendCoins(toolCost, def?.label || tool)) {
+        return;
+      }
     }
 
     if (tool === 'tree') {
-      const updated = this.terrain.getSurfacePointAndNormal(localDir);
       let treeType: PlacedObjectType = 'oak';
-      if (updated.isBeach) {
+      if (surface.isBeach) {
         treeType = 'palm';
-      } else if (updated.isMountain || localDir.y > 0.58) {
+      } else if (surface.isMountain || localDir.y > 0.58) {
         treeType = 'pine';
       }
       this.placeStaticObject(treeType, localDir, Math.random() * Math.PI * 2, true, true);
@@ -2170,7 +2533,6 @@ export class PocketWorldController {
       soundEngine.playPlant();
     }
 
-    // Displace any villagers or sheep standing inside a newly placed structure's footprint
     const bridgesAndDocks = this.placedObjects.filter(
       (o) => o.type === 'bridge' || o.type === 'dock',
     );
@@ -2202,7 +2564,6 @@ export class PocketWorldController {
   }
 
   public selectEntityAtDirection(localDir: THREE.Vector3) {
-    // 1. Check Garden Plots first (generous touch radius)
     let bestId: string | null = null;
     let bestDist = 0.11;
 
@@ -2216,7 +2577,6 @@ export class PocketWorldController {
       }
     }
 
-    // 2. Check Villagers
     if (!bestId) {
       let bestVDist = 0.095;
       for (const v of this.villagers) {
@@ -2228,7 +2588,6 @@ export class PocketWorldController {
       }
     }
 
-    // 3. Check Buildings & Landmarks
     if (!bestId) {
       let bestBDist = 0.125;
       const selectableBuildings: PlacedObjectType[] = [
@@ -2269,43 +2628,190 @@ export class PocketWorldController {
     this.syncWorldStats();
   }
 
+  private getEffectiveWeather(): WeatherPhase {
+    return this.weatherOverride ?? this.weatherPhase;
+  }
+
   private buildSelectedEntityInfo(): SelectedEntityInfo | null {
     if (!this.selectedEntityId) return null;
 
-    // 1. Check Placed Objects (Plots & Buildings)
     const obj = this.placedObjects.find((o) => o.id === this.selectedEntityId);
     if (obj) {
       if (obj.type === 'plot') {
         const cropType = obj.cropType || 'wheat';
+        const hasCrop = obj.hasCrop ?? true;
+        const lifecycleState = this.getPlotLifecycle(obj);
         const cropLabel =
-          cropType === 'wheat'
-            ? 'Golden Wheat'
-            : cropType === 'pumpkin'
-              ? 'Sunlit Pumpkin'
-              : 'Sweet Berries';
+          lifecycleState === 'prepared'
+            ? 'Prepared Soil'
+            : lifecycleState === 'harvested'
+              ? 'Harvested Soil'
+              : CROP_CONFIGS[cropType].label;
         const g = THREE.MathUtils.clamp(obj.growth, 0, 1);
-        const growthPct = Math.round(g * 100);
-        const stage =
-          g >= 0.95 ? 'Ripe' : g >= 0.45 ? 'Growing' : 'Sprouting';
+        const growthPct = hasCrop ? Math.round(g * 100) : 0;
+
+        const stageMap: Record<PlotLifecycleState, string> = {
+          prepared: 'Prepared Bed',
+          sown: 'Sown Seeds',
+          seedling: 'Seedling',
+          growing: 'Growing',
+          ripe: 'Ripe & Ready',
+          harvested: 'Harvested Bed',
+        };
+
         const moisturePct = Math.round((obj.moisture ?? 0.5) * 100);
         const pollinated = this.placedObjects.some(
           (h) => h.type === 'beehive' && h.dir.distanceTo(obj.dir) < 0.35,
         );
+        const isColdWeather =
+          this.getEffectiveWeather() === 'snow' || this.season === 'winter';
+        const pausedByCold = hasCrop && isColdWeather && !obj.hasCloche;
+
+        const reservedVil = obj.reservedByVillagerId
+          ? this.villagers.find((v) => v.id === obj.reservedByVillagerId)
+          : undefined;
 
         return {
           kind: 'plot',
           id: obj.id,
           cropType,
           cropLabel,
-          stage,
+          hasCrop,
+          lifecycleState,
+          stage: stageMap[lifecycleState],
           growthPct,
           moisturePct,
           composted: Boolean(obj.composted),
           pollinated,
+          hasCloche: Boolean(obj.hasCloche),
+          pausedByCold,
+          reservedByVillagerName: reservedVil?.name,
         };
       }
 
-      // Building info
+      // Building contextual metadata with live production state
+      if (obj.type === 'windmill') {
+        const stored = obj.storedOutput || 0;
+        const isProc = Boolean(obj.isProcessing);
+        const progPct = isProc
+          ? Math.min(
+              100,
+              Math.round(
+                ((obj.productionTimer || 0) /
+                  PRODUCTION_CONFIG.windmill.processDurationSec) *
+                  100,
+              ),
+            )
+          : 0;
+        const subtitle = isProc
+          ? `Milling Grain (${progPct}%) · Stored: ${stored}/${PRODUCTION_CONFIG.windmill.maxStorage} Flour`
+          : `Granary Mill · Stored: ${stored}/${PRODUCTION_CONFIG.windmill.maxStorage} Flour (Have ${this.inventory.wheat} Wheat)`;
+        const actionLabel =
+          stored > 0
+            ? `Collect +${stored} Flour`
+            : isProc
+              ? `Milling (${progPct}%)`
+              : 'Mill 2 Wheat → 1 Flour';
+        const canPerform =
+          stored > 0 ||
+          (!isProc &&
+            this.inventory.wheat >= PRODUCTION_CONFIG.windmill.wheatInput &&
+            stored < PRODUCTION_CONFIG.windmill.maxStorage);
+
+        return {
+          kind: 'building',
+          id: obj.id,
+          buildingType: obj.type,
+          title: 'Millstone Grain Windmill',
+          subtitle,
+          harmonyBonus: '40s Grain Processing',
+          actionLabel,
+          actionDescription: 'Grinds 2 harvested Wheat into 1 artisan Flour over 40s',
+          canPerformAction: canPerform,
+          productionProgress: isProc ? progPct : undefined,
+          storedOutput: stored,
+          maxStorage: PRODUCTION_CONFIG.windmill.maxStorage,
+          removable: obj.removable,
+        };
+      }
+
+      if (obj.type === 'beehive') {
+        const stored = obj.storedOutput || 0;
+        const nearbyFlowers = this.placedObjects.filter(
+          (f) => f.type === 'flower' && f.dir.distanceTo(obj.dir) < 0.28,
+        ).length;
+        const progPct =
+          stored >= PRODUCTION_CONFIG.beehive.maxStorage
+            ? 100
+            : Math.min(
+                100,
+                Math.round(
+                  ((obj.productionTimer || 0) /
+                    PRODUCTION_CONFIG.beehive.baseDurationSec) *
+                    100,
+                ),
+              );
+        const subtitle = `Stored: ${stored}/${PRODUCTION_CONFIG.beehive.maxStorage} Honey · Next Jar ${progPct}% (${nearbyFlowers} Wildflowers nearby)`;
+        const actionLabel =
+          stored > 0 ? `Collect +${stored} Honey` : `Gathering Nectar (${progPct}%)`;
+
+        return {
+          kind: 'building',
+          id: obj.id,
+          buildingType: obj.type,
+          title: 'Painted Meadow Apiary',
+          subtitle,
+          harmonyBonus: '+18% Nearby Crop Growth',
+          actionLabel,
+          actionDescription: 'Bees gather wildflower nectar into golden honey jars',
+          canPerformAction: stored > 0,
+          productionProgress:
+            stored < PRODUCTION_CONFIG.beehive.maxStorage ? progPct : undefined,
+          storedOutput: stored,
+          maxStorage: PRODUCTION_CONFIG.beehive.maxStorage,
+          removable: obj.removable,
+        };
+      }
+
+      if (obj.type === 'well') {
+        const needsWater = this.resources.water < PRODUCTION_CONFIG.well.maxWater;
+        return {
+          kind: 'building',
+          id: obj.id,
+          buildingType: obj.type,
+          title: 'Little Meadow Stone Well',
+          subtitle: `Watering Can: ${this.resources.water}/${PRODUCTION_CONFIG.well.maxWater} Water`,
+          harmonyBonus: 'Fresh Spring Water',
+          actionLabel: needsWater ? 'Refill Watering Can (20/20)' : 'Watering Can Full',
+          actionDescription: 'Draw cool spring water to hydrate garden beds',
+          canPerformAction: needsWater,
+          removable: obj.removable,
+        };
+      }
+
+      if (obj.type === 'dock') {
+        const hasGoods =
+          this.inventory.flour > 0 ||
+          this.inventory.honey > 0 ||
+          this.inventory.pumpkin > 0 ||
+          this.inventory.wheat > 0 ||
+          this.inventory.berry > 0;
+        return {
+          kind: 'building',
+          id: obj.id,
+          buildingType: obj.type,
+          title: 'Timber Shoreline Pier',
+          subtitle: hasGoods
+            ? 'Coastal Merchant Ready · Trade Pantry Goods for Coins & Compost'
+            : 'Harbor Mooring · Gather produce or goods to trade with passing boats',
+          harmonyBonus: 'Harbor Trade',
+          actionLabel: hasGoods ? 'Trade Goods (+Coins & +1 Compost)' : 'Ring Harbor Bell',
+          actionDescription: 'Exchange pantry goods with coastal traders',
+          canPerformAction: true,
+          removable: obj.removable,
+        };
+      }
+
       const buildingMeta: Record<
         string,
         {
@@ -2320,22 +2826,8 @@ export class PocketWorldController {
           title: obj.customTitle || 'Pastel Meadow Cottage',
           subtitle: 'Cozy Timber-Frame Home · 2 Residents',
           harmonyBonus: '+2 Village Harmony',
-          actionLabel: 'Tend Window Boxes',
-          actionDescription: 'Water flower boxes & ring hearth bell for residents',
-        },
-        windmill: {
-          title: 'Millstone Grain Windmill',
-          subtitle: 'Turning Canvas Sails · Granary Hub',
-          harmonyBonus: '+3 Village Harmony',
-          actionLabel: 'Mill Golden Grain',
-          actionDescription: 'Grind harvested wheat into +2 Flour & +2 Seeds',
-        },
-        beehive: {
-          title: 'Painted Meadow Apiary',
-          subtitle: 'Pollinates Nearby Crop Plots (+35% Growth)',
-          harmonyBonus: '+2 Pollination Harmony',
-          actionLabel: 'Gather Meadow Honey',
-          actionDescription: 'Collect +1 jar of golden wildflower honey',
+          actionLabel: 'Ring Hearth Bell',
+          actionDescription: 'Invite residents outside to greet the village',
         },
         lighthouse: {
           title: 'Coastal Beacon Lighthouse',
@@ -2358,26 +2850,12 @@ export class PocketWorldController {
           actionLabel: 'Stoke Warm Embers',
           actionDescription: 'Send warm sparks skyward & invite villagers near',
         },
-        dock: {
-          title: 'Timber Shoreline Pier',
-          subtitle: 'Harbor Mooring for Sailboats',
-          harmonyBonus: '+1.5 Coastal Harmony',
-          actionLabel: 'Launch Supply Boat',
-          actionDescription: 'Welcome +2 Seeds from coastal trade',
-        },
         bridge: {
           title: 'Arched Footbridge',
           subtitle: 'Connects Meadow Shores Across Water',
           harmonyBonus: '+1.5 Village Harmony',
-          actionLabel: 'scatter Lantern Petals',
-          actionDescription: 'Adorn the bridge with floating blossoms',
-        },
-        well: {
-          title: 'Little Meadow Stone Well',
-          subtitle: 'Heart of the Village Commons',
-          harmonyBonus: 'Unlimited Fresh Water',
-          actionLabel: 'Draw Fresh Water',
-          actionDescription: 'Refill watering can reserves (+5 Water)',
+          actionLabel: 'Ripple Stream Below',
+          actionDescription: 'Drop a pebble to watch concentric ripples in the stream',
         },
         lantern: {
           title: 'Wrought-Iron Lantern Post',
@@ -2405,25 +2883,19 @@ export class PocketWorldController {
         harmonyBonus: meta.harmonyBonus,
         actionLabel: meta.actionLabel,
         actionDescription: meta.actionDescription,
+        canPerformAction: true,
         removable: obj.removable,
       };
     }
 
-    // 2. Check Villagers
+    // 2. Check Villagers (Live task status instead of static role text)
     const villager = this.villagers.find((v) => v.id === this.selectedEntityId);
     if (villager) {
       const activity =
-        villager.pauseTimer > 0
+        villager.liveActivityLabel ||
+        (villager.pauseTimer > 0
           ? `Resting near ${villager.assignment}`
-          : villager.role === 'Gardener'
-            ? 'Tending soil & checking sprouts'
-            : villager.role === 'Miller'
-              ? 'Carrying grain sacks to the mill'
-              : villager.role === 'Beekeeper'
-                ? 'Checking hives & meadow blossoms'
-                : villager.role === 'Builder'
-                  ? 'Maintaining timber paths & cottages'
-                  : 'Gathering wild berries & herbs';
+          : `Strolling through ${villager.assignment}`);
 
       return {
         kind: 'villager',
@@ -2438,51 +2910,147 @@ export class PocketWorldController {
     return null;
   }
 
-  public waterPlot(plotId: string) {
+  /**
+   * Waters a garden plot. Only increases soil moisture (no instant growth boost).
+   */
+  public waterPlot(plotId: string, byVillager = false): boolean {
     const plot = this.placedObjects.find(
       (o) => o.id === plotId && o.type === 'plot',
     );
-    if (!plot) return;
-    plot.moisture = 1.0;
-    plot.growth = Math.min(1.0, plot.growth + 0.25);
+    if (!plot) return false;
+
+    if (!byVillager && this.resources.water < 1) {
+      this.showStatusMessage(
+        'Watering can is empty — refill at the Stone Well',
+      );
+      return false;
+    }
+
+    const curMoisture = plot.moisture ?? 0.5;
+    if (!byVillager && curMoisture >= 0.96) {
+      this.showStatusMessage('This soil bed is already well-hydrated');
+      return false;
+    }
+
+    if (!byVillager) {
+      this.resources.water = Math.max(0, this.resources.water - 1);
+      this.stats.totalTended += 1;
+    }
+
+    plot.moisture = Math.min(1.0, curMoisture + 0.55);
     plot.bounceTime = 0;
     plot.bounceActive = !this.reducedMotion;
     this.updatePlotVisuals(plot);
-    this.emitSparklesAtDir(plot.dir, '#7ed6ff');
-    this.resources.water = Math.max(0, this.resources.water - 1);
-    this.stats.totalTended += 1;
+
+    const surf = this.terrain.getSurfacePointAndNormal(plot.dir);
+    this.pixelFx.spawnRipple(surf.point, surf.normal, 'soil');
     soundEngine.playWater();
+    this.ambientAudio.playCue('water');
     this.syncWorldStats();
+    return true;
   }
 
-  public compostPlot(plotId: string) {
+  /**
+   * Enriches a plot with compost (+25% subsequent growth speed & +1 bonus yield).
+   * Does not add instant growth.
+   */
+  public compostPlot(plotId: string): boolean {
+    if (!this.isTierUnlocked('kitchen_garden')) {
+      this.showStatusMessage('Rich Compost unlocks at Kitchen Garden tier');
+      return false;
+    }
     const plot = this.placedObjects.find(
       (o) => o.id === plotId && o.type === 'plot',
     );
-    if (!plot) return;
+    if (!plot) return false;
+
+    if (plot.composted) {
+      this.showStatusMessage('This garden bed is already enriched with compost');
+      return false;
+    }
+    if (this.resources.compost < 1) {
+      this.showStatusMessage(
+        'No compost left — craft compost from produce in Inventory',
+      );
+      return false;
+    }
+
+    this.resources.compost -= 1;
     plot.composted = true;
-    plot.growth = Math.min(1.0, plot.growth + 0.32);
     plot.bounceTime = 0;
     plot.bounceActive = !this.reducedMotion;
     this.updatePlotVisuals(plot);
     this.emitSparklesAtDir(plot.dir, '#ffd56b');
-    this.resources.compost = Math.max(0, this.resources.compost - 1);
     this.stats.totalTended += 1;
     soundEngine.playPlant();
     this.syncWorldStats();
+    return true;
   }
 
+  /**
+   * Fits a protective miniature glass cloche over a plot so crops keep growing in winter/snow.
+   */
+  public installClocheOnPlot(plotId: string): boolean {
+    if (!this.isTierUnlocked('flourishing_terrarium')) {
+      this.showStatusMessage(
+        'Glass Cloche unlocks at Flourishing Terrarium tier (110 Garden Points)',
+      );
+      return false;
+    }
+    const plot = this.placedObjects.find(
+      (o) => o.id === plotId && o.type === 'plot',
+    );
+    if (!plot) return false;
+    if (plot.hasCloche) {
+      this.showStatusMessage('This plot is already protected by a glass cloche');
+      return false;
+    }
+    const cost = BUILDING_COSTS.greenhouse_bell || 14;
+    if (!this.spendCoins(cost, 'Glass Cloche')) {
+      return false;
+    }
+    plot.hasCloche = true;
+    plot.bounceTime = 0;
+    plot.bounceActive = !this.reducedMotion;
+    this.updatePlotVisuals(plot);
+    this.emitSparklesAtDir(plot.dir, '#b8f2ff');
+    soundEngine.playBuild();
+    this.showStatusMessage('Fitted a glass cloche — protected from winter snow');
+    this.syncWorldStats();
+    return true;
+  }
+
+  /**
+   * Harvests a single ripe plot. Rejects unripe/empty plots and transitions bed to 'harvested'
+   * (unless auto-replant is unlocked and enabled with available seeds).
+   */
   public harvestPlot(plotId: string): boolean {
     const plot = this.placedObjects.find(
       (o) => o.id === plotId && o.type === 'plot',
     );
     if (!plot) return false;
 
+    const state = this.getPlotLifecycle(plot);
+    if (state !== 'ripe') {
+      if (state === 'prepared' || state === 'harvested') {
+        this.showStatusMessage('This soil bed is empty — sow seeds first');
+      } else {
+        this.showStatusMessage(
+          `Still growing (${Math.round(plot.growth * 100)}%) — wait until ripe to harvest`,
+        );
+      }
+      return false;
+    }
+
     const pollinated = this.placedObjects.some(
       (h) => h.type === 'beehive' && h.dir.distanceTo(plot.dir) < 0.35,
     );
-    const yieldAmount = (plot.composted ? 2 : 1) + (pollinated ? 1 : 0);
     const crop = plot.cropType || 'wheat';
+    const cfg = CROP_CONFIGS[crop];
+    const yieldAmount =
+      cfg.baseYield +
+      (plot.composted ? cfg.compostBonusYield : 0) +
+      (pollinated ? 1 : 0);
 
     if (crop === 'wheat') {
       this.inventory.wheat += yieldAmount;
@@ -2493,19 +3061,46 @@ export class PocketWorldController {
     }
 
     this.resources.harvestTotal += yieldAmount;
-    this.resources.seeds += 1;
     this.stats.totalHarvested += yieldAmount;
 
-    // Reset plot to fresh sprouting cycle
-    plot.growth = 0.24;
-    plot.moisture = Math.max(0.45, (plot.moisture ?? 0.7) - 0.25);
-    plot.composted = false;
+    // Award Garden Points (+bonus on first discovery of a crop)
+    let gpGain = cfg.gardenPointsOnHarvest;
+    if (!this.discoveredCrops.has(crop)) {
+      this.discoveredCrops.add(crop);
+      gpGain += 3;
+    }
+    this.gardenPoints += gpGain;
+
+    // Check if auto-replant is unlocked, enabled, and has a seed available
+    if (
+      this.autoReplantEnabled &&
+      this.isTierUnlocked('flourishing_terrarium') &&
+      (this.seedsByCrop[crop] || 0) >= 1
+    ) {
+      this.seedsByCrop[crop] -= 1;
+      plot.hasCrop = true;
+      plot.harvested = false;
+      plot.growth = 0.02;
+      plot.composted = false;
+      plot.moisture = Math.max(0.35, (plot.moisture ?? 0.65) - 0.18);
+    } else {
+      // Transition bed to 'harvested' state; requires explicit replanting
+      plot.hasCrop = false;
+      plot.harvested = true;
+      plot.growth = 0.0;
+      plot.composted = false;
+      plot.moisture = Math.max(0.3, (plot.moisture ?? 0.65) - 0.2);
+    }
+
+    plot.reservedByVillagerId = null;
     plot.bounceTime = 0;
     plot.bounceActive = !this.reducedMotion;
     this.updatePlotVisuals(plot);
 
-    this.emitSparklesAtDir(plot.dir, '#ffe066');
+    const surf = this.terrain.getSurfacePointAndNormal(plot.dir);
+    this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.23);
     soundEngine.playHarvest();
+    this.ambientAudio.playCue('harvest');
 
     if (this.onHarvestFeedback) {
       this.onHarvestFeedback({
@@ -2519,11 +3114,58 @@ export class PocketWorldController {
     return true;
   }
 
-  public replantPlot(plotId: string, cropType: CropType) {
+  /**
+   * Sows or replants an existing prepared/harvested garden bed using 1 seed of cropType.
+   */
+  public replantPlot(
+    plotId: string,
+    cropType: CropType,
+    byVillager = false,
+  ): boolean {
     const plot = this.placedObjects.find(
       (o) => o.id === plotId && o.type === 'plot',
     );
-    if (!plot) return;
+    if (!plot) return false;
+
+    const state = this.getPlotLifecycle(plot);
+    if (state !== 'prepared' && state !== 'harvested') {
+      if (!byVillager) {
+        this.showStatusMessage(
+          state === 'ripe'
+            ? 'Harvest the ripe crop first before replanting'
+            : 'A crop is already growing in this bed',
+        );
+      }
+      return false;
+    }
+
+    const cfg = CROP_CONFIGS[cropType];
+    if (!this.isTierUnlocked(cfg.unlockTier)) {
+      if (!byVillager) {
+        this.showStatusMessage(`${cfg.label} unlocks at Kitchen Garden tier`);
+      }
+      return false;
+    }
+
+    if ((this.seedsByCrop[cropType] || 0) < 1) {
+      if (!byVillager) {
+        this.showStatusMessage(
+          `No ${cfg.label} seeds available — buy seeds in Inventory`,
+        );
+      }
+      return false;
+    }
+
+    this.seedsByCrop[cropType] -= 1;
+    this.stats.totalPlanted += 1;
+
+    const prevId = plot.id;
+    const prevDir = plot.dir.clone();
+    const prevYaw = plot.yaw;
+    const prevMoisture = plot.moisture ?? 0.65;
+    const prevComposted = Boolean(plot.composted);
+    const prevCloche = Boolean(plot.hasCloche);
+    const wasSelected = this.selectedEntityId === prevId;
 
     const idx = this.placedObjects.indexOf(plot);
     if (idx !== -1) {
@@ -2533,34 +3175,55 @@ export class PocketWorldController {
 
     const replacement = this.placeGardenPlot(
       cropType,
-      plot.dir,
-      plot.yaw,
-      0.3,
-      0.85,
-      Boolean(plot.composted),
+      prevDir,
+      prevYaw,
+      0.02, // 'sown' stage
+      prevMoisture,
+      prevComposted,
       true,
+      {
+        id: prevId,
+        hasCrop: true,
+        harvested: false,
+        hasCloche: prevCloche,
+      },
     );
-    this.selectedEntityId = replacement.id;
+    if (wasSelected) {
+      this.selectedEntityId = replacement.id;
+    }
     soundEngine.playPlant();
+    this.ambientAudio.playCue('plant');
     this.syncWorldStats();
+    return true;
   }
 
+  /**
+   * Harvests all ripe plots and ready beehive/windmill outputs using the shared ripe threshold.
+   * Never advances unripe crop growth when nothing is ready.
+   */
   public harvestAllRipe(): number {
     const batch: Partial<HarvestFeedbackBatch> = {
       wheat: 0,
       pumpkin: 0,
       berry: 0,
       honey: 0,
+      flour: 0,
     };
     let count = 0;
+    let burstCount = 0;
 
     for (const obj of this.placedObjects) {
-      if (obj.type === 'plot' && obj.growth >= 0.75) {
+      if (obj.type === 'plot' && this.getPlotLifecycle(obj) === 'ripe') {
         const pollinated = this.placedObjects.some(
           (h) => h.type === 'beehive' && h.dir.distanceTo(obj.dir) < 0.35,
         );
-        const yieldAmt = (obj.composted ? 2 : 1) + (pollinated ? 1 : 0);
         const crop = obj.cropType || 'wheat';
+        const cfg = CROP_CONFIGS[crop];
+        const yieldAmt =
+          cfg.baseYield +
+          (obj.composted ? cfg.compostBonusYield : 0) +
+          (pollinated ? 1 : 0);
+
         if (crop === 'wheat') {
           this.inventory.wheat += yieldAmt;
           batch.wheat = (batch.wheat || 0) + yieldAmt;
@@ -2571,49 +3234,91 @@ export class PocketWorldController {
           this.inventory.berry += yieldAmt;
           batch.berry = (batch.berry || 0) + yieldAmt;
         }
-        this.resources.harvestTotal += yieldAmt;
-        this.resources.seeds += 1;
-        this.stats.totalHarvested += yieldAmt;
 
-        obj.growth = 0.25;
-        obj.composted = false;
-        obj.moisture = 0.65;
+        this.resources.harvestTotal += yieldAmt;
+        this.stats.totalHarvested += yieldAmt;
+        this.gardenPoints += cfg.gardenPointsOnHarvest;
+        if (!this.discoveredCrops.has(crop)) {
+          this.discoveredCrops.add(crop);
+          this.gardenPoints += 3;
+        }
+
+        if (
+          this.autoReplantEnabled &&
+          this.isTierUnlocked('flourishing_terrarium') &&
+          (this.seedsByCrop[crop] || 0) >= 1
+        ) {
+          this.seedsByCrop[crop] -= 1;
+          obj.hasCrop = true;
+          obj.harvested = false;
+          obj.growth = 0.02;
+          obj.composted = false;
+        } else {
+          obj.hasCrop = false;
+          obj.harvested = true;
+          obj.growth = 0.0;
+          obj.composted = false;
+        }
+        obj.moisture = Math.max(0.3, (obj.moisture ?? 0.65) - 0.18);
+        obj.reservedByVillagerId = null;
         obj.bounceTime = 0;
         obj.bounceActive = !this.reducedMotion;
         this.updatePlotVisuals(obj);
-        this.emitSparklesAtDir(obj.dir, '#ffe066');
+
+        if (burstCount < 3) {
+          const surf = this.terrain.getSurfacePointAndNormal(obj.dir);
+          this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.24);
+          burstCount++;
+        }
         count += yieldAmt;
       }
     }
 
-    // Also gather honey from beehives if any
-    const hives = this.placedObjects.filter((o) => o.type === 'beehive');
-    if (hives.length > 0) {
-      const honeyGain = hives.length;
-      this.inventory.honey += honeyGain;
-      this.resources.harvestTotal += honeyGain;
-      this.stats.totalHarvested += honeyGain;
-      batch.honey = honeyGain;
-      count += honeyGain;
-      hives.forEach((h) => this.emitSparklesAtDir(h.dir, '#ffd54f'));
+    // Also collect ready honey from beehives (only when storedOutput >= 1)
+    for (const hive of this.placedObjects) {
+      if (hive.type === 'beehive' && (hive.storedOutput || 0) >= 1) {
+        const gain = hive.storedOutput || 0;
+        hive.storedOutput = 0;
+        this.inventory.honey += gain;
+        this.resources.harvestTotal += gain;
+        this.stats.totalHarvested += gain;
+        this.gardenPoints += gain * PRODUCTION_CONFIG.beehive.gardenPoints;
+        batch.honey = (batch.honey || 0) + gain;
+        count += gain;
+        if (burstCount < 4) {
+          const surf = this.terrain.getSurfacePointAndNormal(hive.dir);
+          this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.22);
+          burstCount++;
+        }
+      }
+    }
+
+    // Also collect ready flour from windmills (only when storedOutput >= 1)
+    for (const mill of this.placedObjects) {
+      if (mill.type === 'windmill' && (mill.storedOutput || 0) >= 1) {
+        const gain = mill.storedOutput || 0;
+        mill.storedOutput = 0;
+        this.inventory.flour += gain;
+        this.resources.harvestTotal += gain;
+        this.gardenPoints += gain * PRODUCTION_CONFIG.windmill.gardenPoints;
+        batch.flour = (batch.flour || 0) + gain;
+        count += gain;
+        if (burstCount < 4) {
+          const surf = this.terrain.getSurfacePointAndNormal(mill.dir);
+          this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.24);
+          burstCount++;
+        }
+      }
     }
 
     if (count > 0) {
       soundEngine.playHarvest();
+      this.ambientAudio.playCue('harvest');
       if (this.onHarvestFeedback) {
         this.onHarvestFeedback(batch);
       }
     } else {
-      // If no plot was ripe yet, ripen all plots by +35% and harvest any that reach 100%
-      for (const obj of this.placedObjects) {
-        if (obj.type === 'plot') {
-          obj.growth = Math.min(1.0, obj.growth + 0.45);
-          obj.moisture = 1.0;
-          this.updatePlotVisuals(obj);
-          this.emitSparklesAtDir(obj.dir, '#b8e986');
-        }
-      }
-      soundEngine.playWater();
+      this.showStatusMessage('No ripe crops or finished goods are ready yet');
     }
 
     this.syncWorldStats();
@@ -2624,52 +3329,166 @@ export class PocketWorldController {
     const obj = this.placedObjects.find((o) => o.id === buildingId);
     if (!obj) return;
 
+    const surf = this.terrain.getSurfacePointAndNormal(obj.dir);
+
+    if (obj.type === 'windmill') {
+      const stored = obj.storedOutput || 0;
+      if (stored > 0) {
+        obj.storedOutput = 0;
+        this.inventory.flour += stored;
+        this.resources.harvestTotal += stored;
+        this.gardenPoints += stored * PRODUCTION_CONFIG.windmill.gardenPoints;
+        obj.bounceTime = 0;
+        obj.bounceActive = !this.reducedMotion;
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.25);
+        soundEngine.playHarvest();
+        if (this.onHarvestFeedback) {
+          this.onHarvestFeedback({ flour: stored });
+        }
+        this.syncWorldStats();
+        return;
+      }
+
+      if (obj.isProcessing) {
+        this.showStatusMessage('The windmill is currently grinding grain into flour');
+        return;
+      }
+      if (this.inventory.wheat < PRODUCTION_CONFIG.windmill.wheatInput) {
+        this.showStatusMessage(
+          `Need ${PRODUCTION_CONFIG.windmill.wheatInput} harvested Wheat to mill Flour`,
+        );
+        return;
+      }
+      this.inventory.wheat -= PRODUCTION_CONFIG.windmill.wheatInput;
+      obj.isProcessing = true;
+      obj.productionTimer = 0;
+      obj.bounceTime = 0;
+      obj.bounceActive = !this.reducedMotion;
+      soundEngine.playBuild();
+      this.showStatusMessage('Loaded 2 Wheat into the Windmill — milling Flour (40s)');
+      this.syncWorldStats();
+      return;
+    }
+
+    if (obj.type === 'beehive') {
+      const stored = obj.storedOutput || 0;
+      if (stored < 1) {
+        this.showStatusMessage(
+          'Bees are still gathering nectar — plant wildflowers nearby to speed honey',
+        );
+        return;
+      }
+      obj.storedOutput = 0;
+      this.inventory.honey += stored;
+      this.resources.harvestTotal += stored;
+      this.stats.totalHarvested += stored;
+      this.gardenPoints += stored * PRODUCTION_CONFIG.beehive.gardenPoints;
+      obj.bounceTime = 0;
+      obj.bounceActive = !this.reducedMotion;
+      this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.23);
+      soundEngine.playHarvest();
+      if (this.onHarvestFeedback) {
+        this.onHarvestFeedback({ honey: stored });
+      }
+      this.syncWorldStats();
+      return;
+    }
+
+    if (obj.type === 'well') {
+      if (this.resources.water >= PRODUCTION_CONFIG.well.maxWater) {
+        this.showStatusMessage('Your watering can is already full (20/20 Water)');
+        return;
+      }
+      this.resources.water = PRODUCTION_CONFIG.well.maxWater;
+      obj.bounceTime = 0;
+      obj.bounceActive = !this.reducedMotion;
+      this.pixelFx.spawnRipple(surf.point, surf.normal, 'water');
+      soundEngine.playWater();
+      this.showStatusMessage('Refilled watering can at the Stone Well (20/20 Water)');
+      this.syncWorldStats();
+      return;
+    }
+
+    if (obj.type === 'dock') {
+      // Coastal trade exchange: trade 1 Flour or 1 Honey or 2 Produce for Coins + 1 Compost
+      if (this.inventory.flour >= 1) {
+        this.inventory.flour -= 1;
+        this.coins += PRODUCTION_CONFIG.flourSellPrice + 3;
+        this.resources.compost += 1;
+        this.gardenPoints += 2;
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.24);
+        soundEngine.playHarvest();
+        this.showStatusMessage(
+          `Traded 1 Flour at the pier for +${PRODUCTION_CONFIG.flourSellPrice + 3} Coins & +1 Compost`,
+        );
+      } else if (this.inventory.honey >= 1) {
+        this.inventory.honey -= 1;
+        this.coins += PRODUCTION_CONFIG.honeySellPrice + 2;
+        this.resources.compost += 1;
+        this.gardenPoints += 2;
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.24);
+        soundEngine.playHarvest();
+        this.showStatusMessage(
+          `Traded 1 Honey at the pier for +${PRODUCTION_CONFIG.honeySellPrice + 2} Coins & +1 Compost`,
+        );
+      } else if (this.inventory.pumpkin >= 1) {
+        this.inventory.pumpkin -= 1;
+        this.coins += CROP_CONFIGS.pumpkin.sellPrice + 2;
+        this.resources.compost += 1;
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.23);
+        soundEngine.playHarvest();
+        this.showStatusMessage(
+          `Traded 1 Pumpkin at the pier for +${CROP_CONFIGS.pumpkin.sellPrice + 2} Coins & +1 Compost`,
+        );
+      } else if (this.inventory.wheat >= 2) {
+        this.inventory.wheat -= 2;
+        this.coins += CROP_CONFIGS.wheat.sellPrice * 2 + 2;
+        this.resources.compost += 1;
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.23);
+        soundEngine.playHarvest();
+        this.showStatusMessage(
+          `Traded 2 Wheat at the pier for +${CROP_CONFIGS.wheat.sellPrice * 2 + 2} Coins & +1 Compost`,
+        );
+      } else if (this.inventory.berry >= 2) {
+        this.inventory.berry -= 2;
+        this.coins += CROP_CONFIGS.berry.sellPrice * 2 + 2;
+        this.resources.compost += 1;
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.23);
+        soundEngine.playHarvest();
+        this.showStatusMessage(
+          `Traded 2 Berries at the pier for +${CROP_CONFIGS.berry.sellPrice * 2 + 2} Coins & +1 Compost`,
+        );
+      } else {
+        this.pixelFx.spawnRipple(surf.point, surf.normal, 'boat');
+        soundEngine.playWater();
+        this.showStatusMessage(
+          'Bring Flour, Honey, or harvested crops to trade with harbor merchants',
+        );
+      }
+      obj.bounceTime = 0;
+      obj.bounceActive = !this.reducedMotion;
+      this.syncWorldStats();
+      return;
+    }
+
+    if (obj.type === 'bridge') {
+      this.pixelFx.spawnRipple(surf.point, surf.normal, 'water');
+      soundEngine.playWater();
+      return;
+    }
+
+    // Scenic village landmarks: invite 2 nearby villagers to visit
     obj.bounceTime = 0;
     obj.bounceActive = !this.reducedMotion;
     this.emitSparklesAtDir(obj.dir, '#ffe57f');
-
-    if (obj.type === 'windmill') {
-      this.inventory.flour += 2;
-      this.resources.seeds += 2;
-      this.resources.harvestTotal += 2;
-      soundEngine.playHarvest();
-      if (this.onHarvestFeedback) {
-        this.onHarvestFeedback({ flour: 2 });
-      }
-    } else if (obj.type === 'beehive') {
-      this.inventory.honey += 1;
-      this.resources.harvestTotal += 1;
-      this.stats.totalHarvested += 1;
-      // Boost nearby plots
-      for (const p of this.placedObjects) {
-        if (p.type === 'plot' && p.dir.distanceTo(obj.dir) < 0.38) {
-          p.growth = Math.min(1.0, p.growth + 0.22);
-          this.updatePlotVisuals(p);
-        }
-      }
-      soundEngine.playHarvest();
-      if (this.onHarvestFeedback) {
-        this.onHarvestFeedback({ honey: 1 });
-      }
-    } else if (obj.type === 'well') {
-      this.resources.water += 6;
-      soundEngine.playWater();
-    } else if (obj.type === 'dock') {
-      this.resources.seeds += 2;
-      this.resources.compost += 1;
-      soundEngine.playWater();
-    } else {
-      // Direct 2 nearby villagers to visit this landmark
-      const sorted = [...this.villagers].sort(
-        (a, b) => a.dir.distanceTo(obj.dir) - b.dir.distanceTo(obj.dir),
-      );
-      sorted.slice(0, 2).forEach((v) => {
-        v.targetDir = this.getBuildingEntranceDir(obj, 0);
-        v.pauseTimer = 0;
-      });
-      soundEngine.playBuild();
-    }
-
+    const sorted = [...this.villagers].sort(
+      (a, b) => a.dir.distanceTo(obj.dir) - b.dir.distanceTo(obj.dir),
+    );
+    sorted.slice(0, 2).forEach((v) => {
+      v.targetDir = this.getBuildingEntranceDir(obj, 0);
+      v.pauseTimer = 0;
+    });
+    soundEngine.playBuild();
     this.syncWorldStats();
   }
 
@@ -2680,6 +3499,9 @@ export class PocketWorldController {
     if (idx !== -1) {
       const removed = this.placedObjects.splice(idx, 1)[0];
       this.objectsGroup.remove(removed.mesh);
+      if (removed.type === 'oak') {
+        this.syncCanopyEmitters();
+      }
       this.emitSparklesAtDir(removed.dir, '#ffb8b8');
       if (this.selectedEntityId === entityId) {
         this.selectedEntityId = null;
@@ -2693,7 +3515,18 @@ export class PocketWorldController {
   public updateVillagerRole(villagerId: string, role: VillagerRole) {
     const v = this.villagers.find((item) => item.id === villagerId);
     if (!v) return;
+    // Release any previous plot reservation if switching away from Gardener
+    if (v.taskTargetId) {
+      const prevPlot = this.placedObjects.find((p) => p.id === v.taskTargetId);
+      if (prevPlot && prevPlot.reservedByVillagerId === v.id) {
+        prevPlot.reservedByVillagerId = null;
+      }
+    }
     v.role = role;
+    v.taskKind = 'idle';
+    v.taskTargetId = null;
+    v.workTimer = 0;
+    v.pauseTimer = 0;
     this.emitSparklesAtDir(v.dir, '#ffd180');
     soundEngine.playSelect();
     this.syncWorldStats();
@@ -2708,7 +3541,6 @@ export class PocketWorldController {
     v.assignment = assignment;
     v.pauseTimer = 0;
 
-    // Direct villager toward their new assignment area
     if (assignment === 'Meadow Plots') {
       const plot = this.placedObjects.find((o) => o.type === 'plot');
       if (plot) v.targetDir = plot.dir.clone();
@@ -2730,52 +3562,185 @@ export class PocketWorldController {
     this.syncWorldStats();
   }
 
-  public craftSeedsAndCompost() {
-    this.resources.seeds += 4;
-    this.resources.compost += 3;
-    this.resources.water += 4;
+  // =========================================================================
+  // Economy, Market, Compost & Free Seed Fallback Actions
+  // =========================================================================
+
+  public buySeed(cropType: CropType, count = 1): boolean {
+    const cfg = CROP_CONFIGS[cropType];
+    if (!this.isTierUnlocked(cfg.unlockTier)) {
+      this.showStatusMessage(`${cfg.label} unlocks at Kitchen Garden tier`);
+      return false;
+    }
+    const cost = cfg.seedCost * count;
+    if (!this.spendCoins(cost, `${count} ${cfg.label} Seed${count > 1 ? 's' : ''}`)) {
+      return false;
+    }
+    this.seedsByCrop[cropType] = (this.seedsByCrop[cropType] || 0) + count;
     soundEngine.playPlant();
+    this.syncWorldStats();
+    return true;
+  }
+
+  public sellProduce(
+    item: 'wheat' | 'pumpkin' | 'berry' | 'honey' | 'flour',
+    count = 1,
+  ): boolean {
+    const available = this.inventory[item] || 0;
+    if (available < count) {
+      this.showStatusMessage(`Not enough ${item} in pantry to sell`);
+      return false;
+    }
+    const unitPrice =
+      item === 'flour'
+        ? PRODUCTION_CONFIG.flourSellPrice
+        : item === 'honey'
+          ? PRODUCTION_CONFIG.honeySellPrice
+          : CROP_CONFIGS[item].sellPrice;
+
+    this.inventory[item] -= count;
+    const earned = unitPrice * count;
+    this.coins += earned;
+    soundEngine.playHarvest();
+    this.showStatusMessage(`Sold ${count} ${item} for +${earned} Coins`);
+    this.syncWorldStats();
+    return true;
+  }
+
+  public sellAllProduce(): number {
+    let totalEarned = 0;
+    for (const key of ['berry', 'wheat', 'pumpkin', 'honey', 'flour'] as const) {
+      const qty = this.inventory[key] || 0;
+      if (qty > 0) {
+        const unitPrice =
+          key === 'flour'
+            ? PRODUCTION_CONFIG.flourSellPrice
+            : key === 'honey'
+              ? PRODUCTION_CONFIG.honeySellPrice
+              : CROP_CONFIGS[key].sellPrice;
+        totalEarned += qty * unitPrice;
+        this.inventory[key] = 0;
+      }
+    }
+    if (totalEarned > 0) {
+      this.coins += totalEarned;
+      soundEngine.playHarvest();
+      this.showStatusMessage(`Sold pantry goods for +${totalEarned} Coins`);
+      this.syncWorldStats();
+    } else {
+      this.showStatusMessage('No harvested goods in pantry to sell yet');
+    }
+    return totalEarned;
+  }
+
+  public craftCompostFromProduce(): boolean {
+    // Convert any 2 produce items into +2 Compost, or purchase +2 Compost for 6 Coins
+    const totalProduce =
+      this.inventory.berry + this.inventory.wheat + this.inventory.pumpkin;
+    if (totalProduce >= PRODUCTION_CONFIG.compostBin.produceInput) {
+      let remaining = PRODUCTION_CONFIG.compostBin.produceInput;
+      for (const k of ['berry', 'wheat', 'pumpkin'] as const) {
+        while (this.inventory[k] > 0 && remaining > 0) {
+          this.inventory[k] -= 1;
+          remaining -= 1;
+        }
+      }
+      this.resources.compost += PRODUCTION_CONFIG.compostBin.compostOutput;
+      soundEngine.playPlant();
+      this.showStatusMessage('Composted 2 crop clippings into +2 Rich Compost');
+      this.syncWorldStats();
+      return true;
+    }
+
+    if (this.spendCoins(PRODUCTION_CONFIG.compostBuyCost, '2 Rich Compost')) {
+      this.resources.compost += 2;
+      soundEngine.playPlant();
+      this.showStatusMessage('Purchased +2 Rich Compost');
+      this.syncWorldStats();
+      return true;
+    }
+    return false;
+  }
+
+  public canClaimFreeSeedFallback(): boolean {
+    const totalSeeds =
+      (this.seedsByCrop.berry || 0) +
+      (this.seedsByCrop.wheat || 0) +
+      (this.seedsByCrop.pumpkin || 0);
+    const hasGrowingOrRipeCrop = this.placedObjects.some(
+      (o) => o.type === 'plot' && (o.hasCrop ?? true),
+    );
+    const totalProduce =
+      this.inventory.berry +
+      this.inventory.wheat +
+      this.inventory.pumpkin +
+      this.inventory.honey +
+      this.inventory.flour;
+    return (
+      totalSeeds === 0 &&
+      !hasGrowingOrRipeCrop &&
+      totalProduce === 0 &&
+      this.coins < CROP_CONFIGS.berry.seedCost
+    );
+  }
+
+  public claimFreeSeedFallback(): boolean {
+    if (!this.canClaimFreeSeedFallback()) {
+      return false;
+    }
+    this.seedsByCrop.berry += 2;
+    this.seedsByCrop.wheat += 1;
+    this.resources.water = Math.max(this.resources.water, 10);
+    soundEngine.playPlant();
+    this.showStatusMessage(
+      'Received a gift packet of +2 Berry Seeds & +1 Wheat Seed from the village',
+    );
+    this.syncWorldStats();
+    return true;
+  }
+
+  public setAutoReplantEnabled(enabled: boolean) {
+    if (enabled && !this.isTierUnlocked('flourishing_terrarium')) {
+      this.showStatusMessage(
+        'Auto-Replant unlocks at Flourishing Terrarium tier (110 Garden Points)',
+      );
+      return;
+    }
+    this.autoReplantEnabled = enabled;
+    soundEngine.playSelect();
+    this.syncWorldStats();
+  }
+
+  public setAmbientAudioEnabled(enabled: boolean) {
+    this.ambientAudio.setEnabled(enabled);
+  }
+
+  public setAmbientAudioVolume(vol: number) {
+    this.ambientAudio.setVolume(vol);
+  }
+
+  public setPlanetName(name: string) {
+    this.planetName = name;
+    this.syncWorldStats();
+  }
+
+  public setWeatherOverride(phase: WeatherPhase | null) {
+    this.weatherOverride = phase;
+    this.syncCloudsToSharedWeather();
+    soundEngine.playSelect();
     this.syncWorldStats();
   }
 
   public cycleWeather() {
-    const hasSnow = this.clouds.some((c) => c.isSnow && c.isRaining);
-    const hasRain = this.clouds.some((c) => !c.isSnow && c.isRaining);
-
-    if (!hasRain && !hasSnow) {
-      // Activate gentle rain on clouds
-      this.clouds.forEach((c) => {
-        c.isSnow = false;
-        c.isRaining = true;
-        c.rainTimer = 14.0;
-      });
-      // Hydrate all plots
-      for (const obj of this.placedObjects) {
-        if (obj.type === 'plot') {
-          obj.moisture = 1.0;
-          this.updatePlotVisuals(obj);
-        }
-      }
-      soundEngine.playWater();
-    } else if (hasRain) {
-      // Switch to soft snow
-      if (!this.clouds.some((c) => c.isSnow)) {
-        this.spawnCloud(this.wellDirection.clone(), false, 12.0, true);
-      }
-      this.clouds.forEach((c) => {
-        c.isRaining = c.isSnow;
-        c.rainTimer = 12.0;
-      });
-      soundEngine.playSelect();
-    } else {
-      // Clear Breeze
-      this.clouds.forEach((c) => {
-        c.isRaining = false;
-        c.rainTimer = 15.0;
-      });
-      soundEngine.playSelect();
-    }
-    this.syncWorldStats();
+    const order: (WeatherPhase | null)[] = [
+      null,
+      'clear',
+      'rain',
+      'snow',
+    ];
+    const idx = order.indexOf(this.weatherOverride);
+    const next = order[(idx + 1) % order.length];
+    this.setWeatherOverride(next);
   }
 
   public cycleTimeMode() {
@@ -3496,10 +4461,39 @@ export class PocketWorldController {
     }
   }
 
+  private evaluateMilestones(counts: {
+    plots: number;
+    flowers: number;
+    villagers: number;
+  }) {
+    for (const m of MILESTONE_DEFINITIONS) {
+      if (this.completedMilestones.has(m.id)) continue;
+      let cur = 0;
+      if (m.id === 'first_harvest') {
+        cur = this.stats.totalHarvested;
+      } else if (m.id === 'tended_beds') {
+        cur = counts.plots;
+      } else if (m.id === 'sweet_apiary') {
+        cur = counts.flowers;
+      } else if (m.id === 'golden_miller') {
+        cur = this.inventory.flour;
+      } else if (m.id === 'bountiful_pantry') {
+        cur = this.stats.totalHarvested;
+      } else if (m.id === 'peaceful_hamlet') {
+        cur = counts.villagers;
+      }
+      if (cur >= m.target) {
+        this.completedMilestones.add(m.id);
+        this.gardenPoints += m.gardenPointsReward;
+        this.coins += m.coinsReward;
+      }
+    }
+  }
+
   private syncWorldStats() {
     const plots = this.placedObjects.filter((o) => o.type === 'plot').length;
     const ripePlots = this.placedObjects.filter(
-      (o) => o.type === 'plot' && o.growth >= 0.92,
+      (o) => o.type === 'plot' && this.getPlotLifecycle(o) === 'ripe',
     ).length;
     const houses = this.placedObjects.filter((o) => o.type === 'house').length;
     const trees = this.placedObjects.filter(
@@ -3520,6 +4514,14 @@ export class PocketWorldController {
     const clouds = this.clouds.length;
     const boats = this.sailboats.length + this.ducks.length;
 
+    this.evaluateMilestones({ plots, flowers, villagers });
+
+    const totalSeeds =
+      (this.seedsByCrop.berry || 0) +
+      (this.seedsByCrop.wheat || 0) +
+      (this.seedsByCrop.pumpkin || 0);
+    this.resources.seeds = totalSeeds;
+
     const happiness = Math.min(
       100,
       Math.round(
@@ -3536,25 +4538,55 @@ export class PocketWorldController {
       ),
     );
 
-    const hasSnow = this.clouds.some((c) => c.isSnow && c.isRaining);
-    const hasRain = this.clouds.some((c) => !c.isSnow && c.isRaining);
-    const weatherSummary: WeatherSummary = hasSnow
-      ? 'Soft Snow'
-      : hasRain
-        ? 'Gentle Rain'
-        : 'Clear Breeze';
+    const effWeather = this.getEffectiveWeather();
+    const weatherSummary: WeatherSummary =
+      effWeather === 'snow'
+        ? 'Soft Snow'
+        : effWeather === 'rain'
+          ? 'Gentle Rain'
+          : effWeather === 'gathering'
+            ? 'Gathering Clouds'
+            : effWeather === 'clearing'
+              ? 'Fresh After-Rain'
+              : 'Clear Breeze';
+
+    const curTierId = this.getCurrentProgressionTier();
+    const curTierIdx = PROGRESSION_TIERS.findIndex((t) => t.id === curTierId);
+    const curTier = PROGRESSION_TIERS[curTierIdx] || PROGRESSION_TIERS[0];
+    const nextTier =
+      curTierIdx + 1 < PROGRESSION_TIERS.length
+        ? PROGRESSION_TIERS[curTierIdx + 1]
+        : null;
 
     const selectedEntity = this.buildSelectedEntityInfo();
+    const canClaimFreeSeeds = this.canClaimFreeSeedFallback();
 
     this.onStateChange((prev) => ({
       ...prev,
+      planetName: this.planetName,
       population: villagers,
       happiness,
       dayCount: this.dayCount,
       timeOfDay: this.timeOfDay,
       weatherSummary,
+      weatherPhase: effWeather,
+      weatherOverride: this.weatherOverride,
+      season: this.season,
       reducedMotion: this.reducedMotion,
       selectedEntity,
+      coins: this.coins,
+      gardenPoints: this.gardenPoints,
+      progressionTier: curTierId,
+      progressionTierLabel: curTier.label,
+      nextTierLabel: nextTier ? nextTier.label : null,
+      nextTierPoints: nextTier ? nextTier.requiredPoints : null,
+      autoReplantUnlocked: this.isTierUnlocked('flourishing_terrarium'),
+      autoReplantEnabled: this.autoReplantEnabled,
+      canClaimFreeSeeds,
+      seedsByCrop: { ...this.seedsByCrop },
+      completedMilestones: Array.from(this.completedMilestones),
+      statusMessage: this.statusMessage,
+      lastSavedAt: this.lastSavedAt,
       resources: { ...this.resources },
       inventory: { ...this.inventory },
       stats: { ...this.stats },
@@ -3576,7 +4608,8 @@ export class PocketWorldController {
   }
 
   private bindEvents() {
-    const dom = this.renderer.domElement;
+    const dom =
+      this.renderer?.domElement || this.fallbackCanvas || this.container;
     const raycaster = new THREE.Raycaster();
     const pointerNDC = new THREE.Vector2();
 
@@ -3649,7 +4682,6 @@ export class PocketWorldController {
       }
 
       if (this.isDraggingSpin) {
-        // Spin the planet with gentle inertia
         this.angularVelocity.x = dx * 0.0055;
         this.angularVelocity.y = dy * 0.0055;
         this.applyPlanetSpin(this.angularVelocity.x, this.angularVelocity.y);
@@ -3697,7 +4729,14 @@ export class PocketWorldController {
       const h = this.container.clientHeight || window.innerHeight;
       this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
-      this.renderer.setSize(w, h);
+      if (this.renderer) {
+        this.renderer.setSize(w, h);
+      } else if (this.fallbackCanvas) {
+        this.fallbackCanvas.width = w;
+        this.fallbackCanvas.height = h;
+        this.fallbackCanvas.style.width = `${w}px`;
+        this.fallbackCanvas.style.height = `${h}px`;
+      }
     };
 
     const resizeObserver = new ResizeObserver(() => {
@@ -3711,14 +4750,23 @@ export class PocketWorldController {
       }
     };
 
+    const onVisibilityChange = () => {
+      this.isTabHidden = document.hidden;
+      if (!this.isTabHidden) {
+        this.clock.getDelta();
+      } else {
+        this.saveGameManual(true);
+      }
+    };
+
     dom.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     dom.addEventListener('wheel', onWheel, { passive: false });
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', onKeyDown);
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
-    // Save cleanup reference
     (this as unknown as { _cleanup: () => void })._cleanup = () => {
       resizeObserver.disconnect();
       dom.removeEventListener('pointerdown', onPointerDown);
@@ -3727,6 +4775,7 @@ export class PocketWorldController {
       dom.removeEventListener('wheel', onWheel);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }
 
@@ -3742,59 +4791,259 @@ export class PocketWorldController {
     this.planetRoot.quaternion.premultiply(qYaw).premultiply(qPitch);
   }
 
+  private syncCloudsToSharedWeather() {
+    const eff = this.getEffectiveWeather();
+    if (eff === 'snow' && !this.clouds.some((c) => c.isSnow)) {
+      this.spawnCloud(this.wellDirection.clone(), false, 15.0, true);
+    }
+    for (const c of this.clouds) {
+      if (eff === 'rain') {
+        c.isRaining = !c.isSnow;
+      } else if (eff === 'snow') {
+        c.isRaining = c.isSnow;
+      } else {
+        c.isRaining = false;
+      }
+    }
+  }
+
+  private updateWeatherAndSeason(dt: number) {
+    // 1. Season progression (Spring -> Summer -> Autumn -> Winter)
+    this.seasonTimer += dt;
+    if (this.seasonTimer >= SEASON_DURATION_SEC) {
+      this.seasonTimer = 0;
+      const curIdx = SEASONS_ORDER.indexOf(this.season);
+      this.season = SEASONS_ORDER[(curIdx + 1) % SEASONS_ORDER.length];
+      this.syncWorldStats();
+    }
+
+    // 2. Natural weather phase transitions when not manually overridden
+    if (this.weatherOverride === null) {
+      this.weatherTimer -= dt;
+      if (this.weatherTimer <= 0) {
+        if (this.weatherPhase === 'clear') {
+          this.weatherPhase = 'gathering';
+          this.weatherTimer = WEATHER_PHASE_DURATIONS.gathering;
+        } else if (this.weatherPhase === 'gathering') {
+          this.weatherPhase = this.season === 'winter' ? 'snow' : 'rain';
+          this.weatherTimer =
+            this.weatherPhase === 'snow'
+              ? WEATHER_PHASE_DURATIONS.snow
+              : WEATHER_PHASE_DURATIONS.rain;
+        } else if (this.weatherPhase === 'rain' || this.weatherPhase === 'snow') {
+          const wasRain = this.weatherPhase === 'rain';
+          this.weatherPhase = 'clearing';
+          this.weatherTimer = WEATHER_PHASE_DURATIONS.clearing;
+          // Occasional rainbow after rain clears
+          if (
+            wasRain &&
+            Math.random() < 0.45 &&
+            !this.placedObjects.some((o) => o.type === 'rainbow')
+          ) {
+            const rbDir = new THREE.Vector3(-0.32, 0.22, 0.92).normalize();
+            const yaw = this.findCollisionFreeRainbowYaw(rbDir);
+            this.placeStaticObject('rainbow', rbDir, yaw, true, true);
+          }
+        } else {
+          this.weatherPhase = 'clear';
+          this.weatherTimer = WEATHER_PHASE_DURATIONS.clear;
+        }
+        this.syncCloudsToSharedWeather();
+        this.syncWorldStats();
+      }
+    }
+  }
+
+  private scheduleNextFrame() {
+    if (!this.renderer) {
+      this.timerFrameId = window.setTimeout(this.animate, 60);
+      return;
+    }
+    if (this.isSoftwareGl) {
+      try {
+        const gl = this.renderer.getContext() as WebGL2RenderingContext;
+        if (gl && typeof gl.fenceSync === 'function') {
+          const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+          gl.flush();
+          const poll = () => {
+            const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+            if (state === gl.UNSIGNALED) {
+              this.timerFrameId = window.setTimeout(poll, 5);
+            } else {
+              if (sync) gl.deleteSync(sync);
+              this.timerFrameId = window.setTimeout(this.animate, 80);
+            }
+          };
+          this.timerFrameId = window.setTimeout(poll, 5);
+          return;
+        }
+      } catch {
+        // Fallback if fenceSync unavailable
+      }
+      this.timerFrameId = window.setTimeout(this.animate, 80);
+    } else {
+      this.animFrameId = requestAnimationFrame(this.animate);
+    }
+  }
+
+  private renderFallback2D(
+    elapsed: number,
+    dayFactor: number,
+    twilightFactor: number,
+    nightFactor: number,
+  ) {
+    const canvas = this.fallbackCanvas;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+    const cx = w * 0.5;
+    const cy = h * 0.49;
+    const orbR = Math.min(w, h) * 0.31;
+    const planetR = orbR * 0.52;
+
+    // 1. Evening / Twilight / Night Sky Backdrop
+    const skyGrad = ctx.createLinearGradient(0, 0, 0, h);
+    if (nightFactor > 0.5) {
+      skyGrad.addColorStop(0, '#0d1024');
+      skyGrad.addColorStop(0.55, '#19203d');
+      skyGrad.addColorStop(1, '#272c4a');
+    } else if (twilightFactor > 0.4) {
+      skyGrad.addColorStop(0, '#232c54');
+      skyGrad.addColorStop(0.55, '#475482');
+      skyGrad.addColorStop(1, '#8c729e');
+    } else {
+      skyGrad.addColorStop(0, '#73639c');
+      skyGrad.addColorStop(0.55, '#ae99c9');
+      skyGrad.addColorStop(1, '#e0c2d6');
+    }
+    ctx.fillStyle = skyGrad;
+    ctx.fillRect(0, 0, w, h);
+
+    // 2. Chalky Windowsill & Turned Walnut Stand
+    const sillY = cy + orbR * 1.12;
+    ctx.fillStyle = '#f2ede4';
+    ctx.fillRect(0, sillY, w, h - sillY);
+    ctx.fillStyle = '#dfd6c7';
+    ctx.fillRect(0, sillY, w, 10);
+
+    // Walnut stand & brass collar
+    ctx.fillStyle = '#593a24';
+    ctx.beginPath();
+    ctx.moveTo(cx - orbR * 0.48, sillY + 6);
+    ctx.lineTo(cx + orbR * 0.48, sillY + 6);
+    ctx.lineTo(cx + orbR * 0.36, cy + orbR * 0.86);
+    ctx.lineTo(cx - orbR * 0.36, cy + orbR * 0.86);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = '#d4af5f';
+    ctx.fillRect(
+      cx - orbR * 0.38,
+      cy + orbR * 0.82,
+      orbR * 0.76,
+      orbR * 0.11,
+    );
+
+    // 3. Miniature Planet inside the Orb
+    const planetGrad = ctx.createRadialGradient(
+      cx - planetR * 0.28,
+      cy - planetR * 0.28,
+      planetR * 0.1,
+      cx,
+      cy,
+      planetR,
+    );
+    planetGrad.addColorStop(0, dayFactor > 0.3 ? '#8ec973' : '#58855c');
+    planetGrad.addColorStop(0.65, dayFactor > 0.3 ? '#5f9e4c' : '#3a6142');
+    planetGrad.addColorStop(1, '#2f5c56');
+    ctx.fillStyle = planetGrad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, planetR, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Orbiting Sun & Moon
+    const sunAngle = (this.timeOfDay - 0.22) * Math.PI * 2;
+    const orbitR = orbR * 0.78;
+    const sx = cx + Math.sin(sunAngle) * orbitR;
+    const sy = cy - Math.cos(sunAngle) * orbitR * 0.65;
+    ctx.fillStyle = '#ffe680';
+    ctx.beginPath();
+    ctx.arc(sx, sy, 10, 0, Math.PI * 2);
+    ctx.fill();
+
+    const mx = cx - Math.sin(sunAngle) * orbitR;
+    const my = cy + Math.cos(sunAngle) * orbitR * 0.65;
+    ctx.fillStyle = '#dce8ff';
+    ctx.beginPath();
+    ctx.arc(mx, my, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 4. Outer Glass Orb Shell & Window Reflection
+    ctx.strokeStyle = 'rgba(195, 242, 224, 0.55)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.arc(cx, cy, orbR, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255, 250, 240, 0.16)';
+    ctx.beginPath();
+    ctx.ellipse(
+      cx - orbR * 0.42,
+      cy - orbR * 0.38,
+      orbR * 0.22,
+      orbR * 0.14,
+      -0.6,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+
+    void elapsed;
+  }
+
   private animate = () => {
-    this.animFrameId = requestAnimationFrame(this.animate);
+    if (this.isTabHidden) {
+      this.scheduleNextFrame();
+      return;
+    }
 
     const dt = Math.min(this.clock.getDelta(), 0.05);
     const elapsed = this.clock.getElapsedTime();
+
+    // Periodic autosave
+    this.autosaveTimer -= dt;
+    if (this.autosaveTimer <= 0 && !this.tourActive) {
+      this.autosaveTimer = 25;
+      this.saveGameManual(true);
+    }
 
     if (this.shootingStarGazeTimer > 0) {
       this.shootingStarGazeTimer = Math.max(0, this.shootingStarGazeTimer - dt);
     }
 
-    // 1. Tour or Auto Time-of-Day advancement
+    // 1. Tour or Auto Time-of-Day advancement (~12-minute calm day = 1/720 per sec)
     if (this.tourActive) {
       this.updateTour(dt);
-    } else if (this.timeMode === 'auto') {
-      const prevTime = this.timeOfDay;
-      this.timeOfDay = (this.timeOfDay + dt * 0.014) % 1.0;
-      if (this.timeOfDay < prevTime) {
-        this.dayCount += 1;
-        this.syncWorldStats();
+    } else {
+      this.updateWeatherAndSeason(dt);
+      if (this.timeMode === 'auto') {
+        const prevTime = this.timeOfDay;
+        this.timeOfDay = (this.timeOfDay + dt / 720) % 1.0;
+        if (this.timeOfDay < prevTime) {
+          this.dayCount += 1;
+          this.syncWorldStats();
+        }
       }
     }
 
-    // 2. Initial 3-second 360° spin on load, then pause and zoom out a bit
-    if (this.introSpinActive) {
-      if (this.isDraggingSpin || this.tourActive) {
-        this.introSpinActive = false;
-      } else {
-        this.introSpinElapsed += dt;
-        if (this.introSpinElapsed < 3.0) {
-          const progress = this.introSpinElapsed / 3.0;
-          const angle = progress * Math.PI * 2;
-          this.planetRoot.quaternion.setFromAxisAngle(UP_VEC, angle);
-        } else {
-          // Complete 360° turn, pause rotation, and zoom out a bit
-          this.introSpinActive = false;
-          this.planetRoot.quaternion.identity();
-          this.angularVelocity.set(0, 0);
-
-          const zoomDir = this.camTargetPos
-            .clone()
-            .sub(this.camTargetLook)
-            .normalize();
-          const currentDist = this.camTargetPos.distanceTo(this.camTargetLook);
-          this.camTargetPos
-            .copy(this.camTargetLook)
-            .addScaledVector(zoomDir, currentDist * 1.14);
-        }
-      }
-    } else if (!this.isPointerDown && !this.tourActive) {
-      // Planet rotational inertia when not actively dragging
+    // 2. Planet rotational inertia when not actively dragging
+    if (!this.isPointerDown && !this.tourActive) {
       if (this.angularVelocity.lengthSq() > 1e-7) {
         this.applyPlanetSpin(this.angularVelocity.x, this.angularVelocity.y);
-        this.angularVelocity.multiplyScalar(0.94); // Gentle inertia damping
+        this.angularVelocity.multiplyScalar(0.94);
       }
     }
 
@@ -3830,7 +5079,7 @@ export class PocketWorldController {
 
     // 5. Orbit the Little Sun & Pale Moon on opposing sides of a tilted curved path
     const orbitAngle = (t - 0.22) * Math.PI * 2;
-    const orbitRadius = 1.24; // Inside the 1.50 glass orb
+    const orbitRadius = 1.24;
     const sunPos = new THREE.Vector3(
       Math.sin(orbitAngle) * orbitRadius,
       Math.cos(orbitAngle) * orbitRadius * 0.72 + 0.12,
@@ -3863,18 +5112,20 @@ export class PocketWorldController {
     }
     this.moonLight.position.copy(moonPos);
 
-    // Update lighting intensities for Day, Blue Twilight, and Night
-    this.sunLight.intensity = 1.95 * dayFactor + 0.75 * twilightFactor;
+    const effWeather = this.getEffectiveWeather();
+    const isRaining = effWeather === 'rain';
+    const isSnowing = effWeather === 'snow';
+    const weatherDim = isRaining || isSnowing ? 0.82 : effWeather === 'gathering' ? 0.9 : 1.0;
+
+    this.sunLight.intensity =
+      (1.95 * dayFactor + 0.75 * twilightFactor) * weatherDim;
     this.sunLight.color.setRGB(
       1.0,
       THREE.MathUtils.lerp(0.95, 0.68, twilightFactor),
       THREE.MathUtils.lerp(0.78, 0.45, twilightFactor),
     );
-
-    // Moon illuminates silver edges on terrain at night
     this.moonLight.intensity = 1.35 * nightFactor + 0.45 * twilightFactor;
 
-    // Room evening window light & interior fill darken in Night mode
     this.roomWindowLight.intensity =
       1.35 * dayFactor + 0.65 * twilightFactor + 0.18 * nightFactor;
     this.roomAmbientLight.intensity =
@@ -3882,27 +5133,94 @@ export class PocketWorldController {
     this.roomHemiLight.intensity =
       0.52 * dayFactor + 0.44 * twilightFactor + 0.28 * nightFactor;
 
+    const terrainWeatherMode: WeatherMode = isSnowing
+      ? 'snow'
+      : isRaining
+        ? 'rain'
+        : 'clear';
     this.roomEnv.updateTimeOfDay(dayFactor, twilightFactor, nightFactor, elapsed);
-    this.terrain.update(elapsed, dt, nightFactor);
+    this.terrain.update(elapsed, dt, nightFactor, terrainWeatherMode);
+    this.ambientAudio.update(dayFactor, nightFactor, isRaining, isSnowing);
 
-    // 6. Update Placed Objects (Bounce, Windmill, Windows, Lighthouse, Campfire, Watchtower Flag, Butterflies)
+    // 6. Update Placed Objects (Crop Growth, Windmill Production, Beehive Production, Lights)
     const warmGlowFactor = Math.min(1.0, twilightFactor * 0.85 + nightFactor * 1.0);
 
     for (const obj of this.placedObjects) {
       if (obj.type === 'plot') {
-        // Continuous gentle crop ripening on garden plots
+        const hasCrop = obj.hasCrop ?? true;
         const moisture = obj.moisture ?? 0.6;
-        const nearHive = this.placedObjects.some(
-          (h) => h.type === 'beehive' && h.dir.distanceTo(obj.dir) < 0.35,
-        );
-        const speedMult =
-          (moisture > 0.35 ? 1.25 : 0.55) *
-          (obj.composted ? 1.65 : 1.0) *
-          (nearHive ? 1.35 : 1.0);
-        if (obj.growth < 1.0) {
-          obj.growth = Math.min(1.0, obj.growth + dt * 0.018 * speedMult);
-          obj.moisture = Math.max(0.2, moisture - dt * 0.004);
-          this.updatePlotVisuals(obj);
+
+        // Shared weather moisture coupling
+        if (isRaining) {
+          obj.moisture = Math.min(1.0, moisture + dt * 0.032);
+        } else if (effWeather === 'clearing') {
+          obj.moisture = Math.max(0.45, moisture - dt * 0.0005);
+        } else if (effWeather === 'clear' && dayFactor > 0.3) {
+          obj.moisture = Math.max(0.12, moisture - dt * 0.0018);
+        } else {
+          obj.moisture = Math.max(0.18, moisture - dt * 0.0009);
+        }
+
+        if (hasCrop && !isPlotRipe(obj.growth)) {
+          const pausedByCold =
+            (isSnowing || this.season === 'winter') && !obj.hasCloche;
+          if (!pausedByCold) {
+            const cropType = obj.cropType || 'wheat';
+            const baseDuration = CROP_CONFIGS[cropType].growthDurationSec;
+            const curM = obj.moisture ?? 0.6;
+            const moistureMult =
+              curM >= 0.35 ? 1.0 + (curM - 0.35) * 0.3 : 0.35;
+            const compostMult = obj.composted ? 1.25 : 1.0;
+            const nearHive = this.placedObjects.some(
+              (h) => h.type === 'beehive' && h.dir.distanceTo(obj.dir) < 0.35,
+            );
+            const hiveMult = nearHive ? 1.18 : 1.0;
+
+            const wasRipe = isPlotRipe(obj.growth);
+            obj.growth = Math.min(
+              1.0,
+              obj.growth +
+                (dt / baseDuration) * moistureMult * compostMult * hiveMult,
+            );
+            if (!wasRipe && isPlotRipe(obj.growth)) {
+              this.syncWorldStats();
+            }
+          }
+        }
+        this.updatePlotVisuals(obj);
+      } else if (obj.type === 'windmill') {
+        if (obj.isProcessing) {
+          obj.productionTimer = (obj.productionTimer || 0) + dt;
+          if (
+            obj.productionTimer >=
+            PRODUCTION_CONFIG.windmill.processDurationSec
+          ) {
+            obj.isProcessing = false;
+            obj.productionTimer = 0;
+            obj.storedOutput = Math.min(
+              PRODUCTION_CONFIG.windmill.maxStorage,
+              (obj.storedOutput || 0) + PRODUCTION_CONFIG.windmill.flourOutput,
+            );
+            this.syncWorldStats();
+          }
+        }
+      } else if (obj.type === 'beehive') {
+        const stored = obj.storedOutput || 0;
+        if (
+          stored < PRODUCTION_CONFIG.beehive.maxStorage &&
+          !isRaining &&
+          !isSnowing
+        ) {
+          const nearbyFlowers = this.placedObjects.filter(
+            (f) => f.type === 'flower' && f.dir.distanceTo(obj.dir) < 0.28,
+          ).length;
+          const flowerMult = 1.0 + Math.min(4, nearbyFlowers) * 0.15;
+          obj.productionTimer = (obj.productionTimer || 0) + dt * flowerMult;
+          if (obj.productionTimer >= PRODUCTION_CONFIG.beehive.baseDurationSec) {
+            obj.productionTimer = 0;
+            obj.storedOutput = stored + 1;
+            this.syncWorldStats();
+          }
         }
       } else if (Math.abs(obj.growth - obj.targetGrowth) > 0.001) {
         obj.growth = THREE.MathUtils.lerp(obj.growth, obj.targetGrowth, dt * 3.5);
@@ -3923,7 +5241,8 @@ export class PocketWorldController {
       obj.mesh.scale.setScalar(baseScale * bounceScale);
 
       if (obj.windmillRotor && !this.reducedMotion) {
-        obj.windmillRotor.rotation.z -= dt * 1.15;
+        const spinRate = obj.isProcessing ? 1.95 : 1.05;
+        obj.windmillRotor.rotation.z -= dt * spinRate;
       }
 
       if (obj.windowMaterials) {
@@ -3935,8 +5254,6 @@ export class PocketWorldController {
 
       if (obj.lighthouseBeamPivot && obj.lighthouseConeMats && obj.lighthousePointLight) {
         if (this.tourActive && this.tourElapsed >= 27.0) {
-          // Smoothly align the lighthouse beam perpendicular to the camera's view ray and tower axis
-          // so the searchlight is strictly 90° perpendicular to the lighthouse in both 3D and 2D screen space at 0:29
           obj.mesh.updateMatrixWorld(true);
           const worldQuat = new THREE.Quaternion();
           obj.mesh.getWorldQuaternion(worldQuat);
@@ -3975,7 +5292,6 @@ export class PocketWorldController {
         obj.lighthousePointLight.intensity = warmGlowFactor * 0.85;
       }
 
-      // Campfire crackling flames, rising ember particles & warm orange glow
       if (obj.campfireFlameGroup && obj.campfireEmbers && obj.campfireLight) {
         const flicker = 1.0 + Math.sin(elapsed * 18.0 + obj.yaw) * 0.16;
         obj.campfireFlameGroup.scale.set(
@@ -3996,13 +5312,11 @@ export class PocketWorldController {
         emberPos.needsUpdate = true;
       }
 
-      // Stone Watchtower waving pennant flag
       if (obj.watchtowerFlag) {
         obj.watchtowerFlag.rotation.y =
           Math.sin(elapsed * 5.2 + obj.yaw) * 0.24;
       }
 
-      // Beehive fluttering butterflies & golden bees
       if (obj.butterflySwarm) {
         obj.butterflySwarm.rotation.y = elapsed * 1.4;
         obj.butterflySwarm.children.forEach((bPivot, idx) => {
@@ -4015,8 +5329,526 @@ export class PocketWorldController {
       }
     }
 
-    // 7. Update Villagers traveling between homes, stone well, bridges & campfires
-    //    with look-ahead tangent steering around buildings/fences & hard non-penetration physics
+    // 7. Update Villagers (with real functional jobs for Gardener, Miller, Beekeeper)
+    this.updateVillagersSimulation(dt, elapsed);
+
+    // 8. Update White Sheep grazing inside the fenced pasture & respecting all fences/structures
+    const bridgesAndDocks = this.placedObjects.filter(
+      (o) => o.type === 'bridge' || o.type === 'dock',
+    );
+    const pRight = new THREE.Vector3()
+      .crossVectors(UP_VEC, this.pastureCenter)
+      .normalize();
+    const pUp = new THREE.Vector3()
+      .crossVectors(this.pastureCenter, pRight)
+      .normalize();
+
+    for (const s of this.sheepList) {
+      s.grazeTimer -= dt;
+      if (s.grazeTimer <= 0) {
+        s.isGrazing = !s.isGrazing;
+        s.grazeTimer = s.isGrazing
+          ? 2.0 + Math.random() * 2.5
+          : 2.2 + Math.random() * 2.0;
+        if (!s.isGrazing) {
+          if (s.inPasture) {
+            const maxR = this.pastureRadius - 0.025;
+            for (let attempt = 0; attempt < 12; attempt++) {
+              const angle = Math.random() * Math.PI * 2;
+              const r = (0.15 + Math.random() * 0.85) * maxR;
+              const candidate = this.pastureCenter
+                .clone()
+                .addScaledVector(pRight, Math.cos(angle) * r)
+                .addScaledVector(pUp, Math.sin(angle) * r)
+                .normalize();
+              if (this.isPositionClearOfObstacles(candidate, 0.012, true)) {
+                s.targetDir.copy(candidate);
+                break;
+              }
+            }
+          } else {
+            for (let attempt = 0; attempt < 12; attempt++) {
+              const offset = new THREE.Vector3(
+                (Math.random() - 0.5) * 0.14,
+                (Math.random() - 0.5) * 0.14,
+                (Math.random() - 0.5) * 0.14,
+              );
+              const candidate = s.dir.clone().add(offset).normalize();
+              if (this.isPositionClearOfObstacles(candidate, 0.014, false)) {
+                s.targetDir.copy(candidate);
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      s.tailMesh.rotation.y = Math.sin(elapsed * 8.5 + s.walkPhase) * 0.32;
+
+      if (s.isGrazing) {
+        s.headGroup.rotation.x =
+          0.48 + Math.sin(elapsed * 7.0 + s.walkPhase) * 0.14;
+        for (const leg of s.legs) {
+          leg.rotation.x = THREE.MathUtils.lerp(leg.rotation.x, 0, dt * 8);
+        }
+      } else {
+        s.headGroup.rotation.x = THREE.MathUtils.lerp(
+          s.headGroup.rotation.x,
+          0.0,
+          dt * 6.0,
+        );
+        const dist = s.dir.distanceTo(s.targetDir);
+        if (dist > 0.008) {
+          const prevSheepDir = s.dir.clone();
+          s.dir
+            .lerp(s.targetDir, (s.speed * dt) / Math.max(dist, 0.01))
+            .normalize();
+
+          const hitBoundary = this.resolveSheepCollisions(s, prevSheepDir);
+          if (hitBoundary) {
+            s.targetDir.copy(
+              s.inPasture ? this.pastureCenter : prevSheepDir,
+            );
+          }
+
+          s.walkPhase += dt * 12.0;
+          const stride = Math.sin(s.walkPhase);
+          const hop = Math.abs(stride) * 0.0025;
+
+          if (s.legs.length === 4) {
+            s.legs[0].rotation.x = stride * 0.45;
+            s.legs[1].rotation.x = -stride * 0.45;
+            s.legs[2].rotation.x = -stride * 0.45;
+            s.legs[3].rotation.x = stride * 0.45;
+          }
+
+          const surf = this.terrain.getSurfacePointAndNormal(s.dir);
+          s.mesh.position.copy(surf.point).addScaledVector(surf.normal, hop);
+
+          const moveTangent = s.targetDir
+            .clone()
+            .sub(s.dir)
+            .projectOnPlane(surf.normal)
+            .normalize();
+          const alignQuat = new THREE.Quaternion().setFromUnitVectors(
+            UP_VEC,
+            surf.normal,
+          );
+          if (moveTangent.lengthSq() > 1e-5) {
+            const invAlign = alignQuat.clone().invert();
+            const localTangent = moveTangent.clone().applyQuaternion(invAlign);
+            const targetYaw = Math.atan2(localTangent.x, localTangent.z);
+            let diff = targetYaw - s.yaw;
+            while (diff > Math.PI) diff -= Math.PI * 2;
+            while (diff < -Math.PI) diff += Math.PI * 2;
+            s.yaw += diff * Math.min(1.0, dt * 8.0);
+          }
+          const yawQuat = new THREE.Quaternion().setFromAxisAngle(UP_VEC, s.yaw);
+          s.mesh.quaternion.copy(alignQuat).multiply(yawQuat);
+        } else {
+          s.isGrazing = true;
+          s.grazeTimer = 1.8 + Math.random() * 2.2;
+        }
+      }
+    }
+
+    // 9. Update Sailboats
+    for (const b of this.sailboats) {
+      b.lanternMat.emissiveIntensity = 0.2 + warmGlowFactor * 2.3;
+
+      const dist = b.dir.distanceTo(b.targetDir);
+      if (dist < 0.03) {
+        b.targetDir = this.pickRandomWaterTarget(b.dir);
+      } else {
+        const nextDir = b.dir
+          .clone()
+          .lerp(b.targetDir, (b.speed * dt) / Math.max(dist, 0.01))
+          .normalize();
+        const surf = this.terrain.getSurfacePointAndNormal(nextDir);
+        const hitsPier = bridgesAndDocks.some(
+          (pier) => pier.dir.distanceTo(nextDir) < 0.052,
+        );
+        const hitsOtherBoat = this.sailboats.some(
+          (other) => other !== b && other.dir.distanceTo(nextDir) < 0.048,
+        );
+
+        if (surf.isWater && !hitsPier && !hitsOtherBoat) {
+          const tangent = b.targetDir
+            .clone()
+            .sub(b.dir)
+            .projectOnPlane(nextDir)
+            .normalize();
+          if (tangent.lengthSq() > 1e-5) {
+            b.yaw = Math.atan2(tangent.x, tangent.z);
+          }
+          b.dir.copy(nextDir);
+        } else {
+          b.targetDir = this.pickRandomWaterTarget(b.dir);
+        }
+      }
+
+      const bobOffset = Math.sin(elapsed * 2.6 + b.bobPhase) * 0.0022;
+      this.orientObjectOnSurface(b.mesh, b.dir, b.yaw, bobOffset, true);
+      b.hullGroup.rotation.z = Math.sin(elapsed * 2.1 + b.bobPhase) * 0.085;
+      b.hullGroup.rotation.x = Math.cos(elapsed * 1.8 + b.bobPhase) * 0.05;
+    }
+
+    // 10. Update Paddling Swans & Ducks
+    for (const d of this.ducks) {
+      const dist = d.dir.distanceTo(d.targetDir);
+      if (dist < 0.025) {
+        d.targetDir = this.pickRandomWaterTarget(d.dir);
+      } else {
+        const nextDir = d.dir
+          .clone()
+          .lerp(d.targetDir, (d.speed * dt) / Math.max(dist, 0.01))
+          .normalize();
+        const surf = this.terrain.getSurfacePointAndNormal(nextDir);
+        const hitsPier = bridgesAndDocks.some(
+          (pier) => pier.dir.distanceTo(nextDir) < 0.044,
+        );
+        const hitsBoat = this.sailboats.some(
+          (boat) => boat.dir.distanceTo(nextDir) < 0.045,
+        );
+
+        if (surf.isWater && !hitsPier && !hitsBoat) {
+          const tangent = d.targetDir
+            .clone()
+            .sub(d.dir)
+            .projectOnPlane(nextDir)
+            .normalize();
+          if (tangent.lengthSq() > 1e-5) {
+            d.yaw = Math.atan2(tangent.x, tangent.z);
+          }
+          d.dir.copy(nextDir);
+        } else {
+          d.targetDir = this.pickRandomWaterTarget(d.dir);
+        }
+      }
+
+      const bobOffset = Math.sin(elapsed * 3.4 + d.bobPhase) * 0.0012;
+      this.orientObjectOnSurface(d.mesh, d.dir, d.yaw, bobOffset, true);
+
+      d.rippleRings.forEach((ring, idx) => {
+        const rippleCycle = (elapsed * 0.85 + idx * 0.5 + d.bobPhase) % 1.0;
+        const scale = 0.8 + rippleCycle * 1.45;
+        ring.scale.setScalar(scale);
+        (ring.material as THREE.MeshBasicMaterial).opacity =
+          (1.0 - rippleCycle) * 0.45;
+      });
+    }
+
+    // 11. Update Hot Air Balloons
+    for (const bal of this.balloons) {
+      const qStep = new THREE.Quaternion().setFromAxisAngle(
+        bal.orbitAxis,
+        bal.orbitSpeed * dt,
+      );
+      bal.currentDir.applyQuaternion(qStep).normalize();
+      const alt =
+        bal.baseAltitude + Math.sin(elapsed * 1.2 + bal.phase) * 0.018;
+      bal.mesh.position.copy(bal.currentDir).multiplyScalar(alt);
+      bal.mesh.quaternion.setFromUnitVectors(UP_VEC, bal.currentDir);
+
+      const burnerPulse =
+        Math.max(0, Math.sin(elapsed * 2.4 + bal.phase * 2.0)) * 1.8;
+      bal.burnerMat.emissiveIntensity = 0.7 + burnerPulse + warmGlowFactor * 1.1;
+    }
+
+    // 12. Update Puffy Clouds & Frosty Snow Clouds (driven by shared weather controller)
+    for (const c of this.clouds) {
+      const qStep = new THREE.Quaternion().setFromAxisAngle(
+        c.orbitAxis,
+        c.orbitSpeed * dt,
+      );
+      c.currentDir.applyQuaternion(qStep).normalize();
+      c.mesh.position.copy(c.currentDir).multiplyScalar(c.altitude);
+      c.mesh.quaternion.setFromUnitVectors(UP_VEC, c.currentDir);
+
+      if (!this.tourActive) {
+        c.isRaining = c.isSnow ? isSnowing : isRaining;
+      }
+
+      if (c.isSnow && c.snowPoints && c.snowMat) {
+        const targetSnowOpacity = c.isRaining ? 0.88 : 0.0;
+        c.snowMat.opacity = THREE.MathUtils.lerp(
+          c.snowMat.opacity,
+          targetSnowOpacity,
+          dt * 4.0,
+        );
+        if (c.isRaining) {
+          c.snowPoints.position.y = -((elapsed * 0.14) % 0.06);
+          c.snowPoints.rotation.y = elapsed * 0.8;
+          this.terrain.applySnowAtDirection(c.currentDir, dt);
+        }
+      } else {
+        const targetRainOpacity = c.isRaining ? 0.65 : 0.0;
+        c.rainMat.opacity = THREE.MathUtils.lerp(
+          c.rainMat.opacity,
+          targetRainOpacity,
+          dt * 4.0,
+        );
+
+        if (c.isRaining) {
+          c.rainLines.position.y = -((elapsed * 0.38) % 0.06);
+          this.terrain.applyRainAtDirection(c.currentDir, dt);
+        }
+      }
+    }
+
+    // 13. Update Shooting Stars
+    for (let i = this.shootingStars.length - 1; i >= 0; i--) {
+      const st = this.shootingStars[i];
+      st.age += dt;
+      if (st.age >= st.maxAge) {
+        this.atmosphereGroup.remove(st.mesh);
+        this.shootingStars.splice(i, 1);
+        continue;
+      }
+
+      const prevPos = st.currentDir.clone().multiplyScalar(st.altitude);
+      const qStep = new THREE.Quaternion().setFromAxisAngle(
+        st.orbitAxis,
+        st.speed * dt,
+      );
+      st.currentDir.applyQuaternion(qStep).normalize();
+      const nextPos = st.currentDir.clone().multiplyScalar(st.altitude);
+
+      st.mesh.position.copy(nextPos);
+      const velDir = nextPos.clone().sub(prevPos).normalize();
+      if (velDir.lengthSq() > 1e-5) {
+        const targetLook = nextPos.clone().add(velDir);
+        st.mesh.lookAt(targetLook);
+      }
+
+      const fade = 1.0 - Math.pow(st.age / st.maxAge, 2.0);
+      st.mesh.scale.setScalar(Math.max(0.01, fade));
+
+      st.sparkleTimer += dt;
+      if (st.sparkleTimer > 0.09) {
+        st.sparkleTimer = 0;
+        this.emitSparklesAtDir(st.currentDir, '#fff4b8', st.altitude);
+      }
+    }
+
+    // 14. Update QuietPixelEffectsCoordinator (Ripples, Collect Bursts, Dusk/Night Fireflies, Seasonal Petals/Leaves)
+    this.firefliesMat.opacity = 0; // Replaced by PixelFX wandering/pulsing firefly clusters
+    this.pixelFx.update(dt, elapsed, {
+      nightFactor,
+      twilightFactor,
+      season: this.season,
+      isRaining,
+      sampleWaterSurfacePoint: () => {
+        if (this.sailboats.length > 0 && Math.random() < 0.5) {
+          const b = this.sailboats[Math.floor(Math.random() * this.sailboats.length)];
+          const d = this.pickRandomWaterTarget(b.dir);
+          return {
+            pos: d.clone().multiplyScalar(this.terrain.seaLevel),
+            normal: d,
+          };
+        }
+        const seaCenter = new THREE.Vector3(0.62, -0.16, 0.76).normalize();
+        const d = this.pickRandomWaterTarget(seaCenter);
+        return {
+          pos: d.clone().multiplyScalar(this.terrain.seaLevel),
+          normal: d,
+        };
+      },
+    });
+
+    // 15. Update Sparkle Bursts
+    for (let i = this.sparkles.length - 1; i >= 0; i--) {
+      const b = this.sparkles[i];
+      b.age += dt;
+      if (b.age >= b.maxAge) {
+        this.effectsGroup.remove(b.points);
+        b.points.geometry.dispose();
+        (b.points.material as THREE.Material).dispose();
+        this.sparkles.splice(i, 1);
+        continue;
+      }
+      const posAttr = b.points.geometry.attributes.position;
+      for (let k = 0; k < b.velocities.length; k++) {
+        const vx = posAttr.getX(k) + b.velocities[k].x * dt;
+        const vy = posAttr.getY(k) + b.velocities[k].y * dt;
+        const vz = posAttr.getZ(k) + b.velocities[k].z * dt;
+        posAttr.setXYZ(k, vx, vy, vz);
+      }
+      posAttr.needsUpdate = true;
+      (b.points.material as THREE.PointsMaterial).opacity =
+        1.0 - b.age / b.maxAge;
+    }
+
+    // 16. Update Contextual Selection Ring on surface
+    if (this.selectedEntityId && !this.tourActive) {
+      const selObj = this.placedObjects.find((o) => o.id === this.selectedEntityId);
+      const selVil = !selObj
+        ? this.villagers.find((v) => v.id === this.selectedEntityId)
+        : undefined;
+      const targetDir = selObj ? selObj.dir : selVil ? selVil.dir : null;
+
+      if (targetDir) {
+        this.selectionRing.visible = true;
+        const stickToSea = selObj?.type === 'dock' || selObj?.type === 'bridge';
+        this.orientObjectOnSurface(
+          this.selectionRing,
+          targetDir,
+          elapsed * (this.reducedMotion ? 0 : 0.45),
+          0.005,
+          stickToSea,
+        );
+        const scaleBase = selVil ? 0.68 : selObj?.type === 'plot' ? 0.96 : 1.18;
+        this.selectionRing.scale.setScalar(scaleBase);
+
+        if (elapsed - this.lastSelectionSyncTime > 0.85) {
+          this.lastSelectionSyncTime = elapsed;
+          this.syncWorldStats();
+        }
+      } else {
+        this.selectionRing.visible = false;
+      }
+    } else {
+      this.selectionRing.visible = false;
+    }
+
+    if (this.renderer) {
+      this.renderer.render(this.scene, this.camera);
+    } else {
+      this.renderFallback2D(elapsed, dayFactor, twilightFactor, nightFactor);
+    }
+    this.scheduleNextFrame();
+  };
+
+  private assignFunctionalJobIfAvailable(v: VillagerEntity): boolean {
+    if (v.role === 'Gardener') {
+      // Find unreserved dry plot (< 65% moisture) or harvested plot if auto-replant is unlocked
+      for (const p of this.placedObjects) {
+        if (p.type !== 'plot') continue;
+        if (p.reservedByVillagerId && p.reservedByVillagerId !== v.id) continue;
+
+        const state = this.getPlotLifecycle(p);
+        if (
+          (p.hasCrop ?? true) &&
+          state !== 'ripe' &&
+          (p.moisture ?? 0.6) < 0.65
+        ) {
+          p.reservedByVillagerId = v.id;
+          v.taskKind = 'watering_plot';
+          v.taskTargetId = p.id;
+          v.targetDir = this.getBuildingEntranceDir(p, 0);
+          const cropLabel = CROP_CONFIGS[p.cropType || 'wheat'].label;
+          v.liveActivityLabel = `Walking to water ${cropLabel} bed`;
+          return true;
+        }
+
+        if (
+          state === 'harvested' &&
+          this.autoReplantEnabled &&
+          this.isTierUnlocked('flourishing_terrarium')
+        ) {
+          const crop = p.cropType || 'berry';
+          if ((this.seedsByCrop[crop] || 0) >= 1) {
+            p.reservedByVillagerId = v.id;
+            v.taskKind = 'replanting_plot';
+            v.taskTargetId = p.id;
+            v.targetDir = this.getBuildingEntranceDir(p, 0);
+            v.liveActivityLabel = `Walking to replant ${CROP_CONFIGS[crop].label} bed`;
+            return true;
+          }
+        }
+      }
+    } else if (v.role === 'Miller') {
+      const mill = this.placedObjects.find(
+        (o) =>
+          o.type === 'windmill' &&
+          ((o.storedOutput || 0) >= 1 ||
+            (!o.isProcessing &&
+              this.inventory.wheat >= PRODUCTION_CONFIG.windmill.wheatInput)),
+      );
+      if (mill) {
+        v.taskKind = 'tending_mill';
+        v.taskTargetId = mill.id;
+        v.targetDir = this.getBuildingEntranceDir(mill, 0);
+        v.liveActivityLabel =
+          (mill.storedOutput || 0) >= 1
+            ? 'Walking to Windmill to collect Flour'
+            : 'Carrying Wheat to the Windmill';
+        return true;
+      }
+    } else if (v.role === 'Beekeeper') {
+      const hive = this.placedObjects.find(
+        (o) => o.type === 'beehive' && (o.storedOutput || 0) >= 1,
+      );
+      if (hive) {
+        v.taskKind = 'tending_hive';
+        v.taskTargetId = hive.id;
+        v.targetDir = this.getBuildingEntranceDir(hive, 0);
+        v.liveActivityLabel = 'Walking to Apiary to gather Honey';
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private completeVillagerTask(v: VillagerEntity) {
+    if (!v.taskTargetId) {
+      v.taskKind = 'idle';
+      return;
+    }
+    const targetObj = this.placedObjects.find((o) => o.id === v.taskTargetId);
+    if (!targetObj) {
+      v.taskKind = 'idle';
+      v.taskTargetId = null;
+      return;
+    }
+
+    if (v.taskKind === 'watering_plot' && targetObj.type === 'plot') {
+      targetObj.reservedByVillagerId = null;
+      this.waterPlot(targetObj.id, true);
+      v.liveActivityLabel = `Watered ${CROP_CONFIGS[targetObj.cropType || 'wheat'].label} bed`;
+    } else if (v.taskKind === 'replanting_plot' && targetObj.type === 'plot') {
+      targetObj.reservedByVillagerId = null;
+      const crop = targetObj.cropType || 'berry';
+      this.replantPlot(targetObj.id, crop, true);
+      v.liveActivityLabel = `Sowed fresh ${CROP_CONFIGS[crop].label} seeds`;
+    } else if (v.taskKind === 'tending_mill' && targetObj.type === 'windmill') {
+      if ((targetObj.storedOutput || 0) >= 1) {
+        const gain = targetObj.storedOutput || 0;
+        targetObj.storedOutput = 0;
+        this.inventory.flour += gain;
+        this.resources.harvestTotal += gain;
+        const surf = this.terrain.getSurfacePointAndNormal(targetObj.dir);
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.22);
+        v.liveActivityLabel = `Collected +${gain} Flour from Windmill`;
+        this.syncWorldStats();
+      } else if (
+        !targetObj.isProcessing &&
+        this.inventory.wheat >= PRODUCTION_CONFIG.windmill.wheatInput
+      ) {
+        this.inventory.wheat -= PRODUCTION_CONFIG.windmill.wheatInput;
+        targetObj.isProcessing = true;
+        targetObj.productionTimer = 0;
+        v.liveActivityLabel = 'Loaded 2 Wheat into the Windmill';
+        this.syncWorldStats();
+      }
+    } else if (v.taskKind === 'tending_hive' && targetObj.type === 'beehive') {
+      if ((targetObj.storedOutput || 0) >= 1) {
+        const gain = targetObj.storedOutput || 0;
+        targetObj.storedOutput = 0;
+        this.inventory.honey += gain;
+        this.resources.harvestTotal += gain;
+        const surf = this.terrain.getSurfacePointAndNormal(targetObj.dir);
+        this.pixelFx.spawnCollectBurst(surf.point, surf.normal, 0.22);
+        v.liveActivityLabel = `Gathered +${gain} Honey from Apiary`;
+        this.syncWorldStats();
+      }
+    }
+
+    v.taskKind = 'idle';
+    v.taskTargetId = null;
+  }
+
+  private updateVillagersSimulation(dt: number, elapsed: number) {
     const bridgesAndDocks = this.placedObjects.filter(
       (o) => o.type === 'bridge' || o.type === 'dock',
     );
@@ -4024,7 +5856,6 @@ export class PocketWorldController {
 
     for (const v of this.villagers) {
       if (this.shootingStarGazeTimer > 0) {
-        // Stop, look up at the sky, and wave excitedly while watching the shooting star!
         v.bodyMesh.position.y = Math.abs(Math.sin(elapsed * 10.0)) * 0.0025;
         v.headGroup.rotation.x = THREE.MathUtils.lerp(
           v.headGroup.rotation.x,
@@ -4038,6 +5869,23 @@ export class PocketWorldController {
         continue;
       }
 
+      // Active tending work animation at target plot/building
+      if ((v.workTimer || 0) > 0) {
+        v.workTimer = (v.workTimer || 0) - dt;
+        v.bodyMesh.position.y = 0;
+        v.leftLeg.rotation.x = 0;
+        v.rightLeg.rotation.x = 0;
+        v.leftArm.rotation.x = -0.6 + Math.sin(elapsed * 10.0) * 0.35;
+        v.rightArm.rotation.x = -0.6 - Math.sin(elapsed * 10.0) * 0.35;
+        v.headGroup.rotation.x = 0.22;
+        if ((v.workTimer || 0) <= 0) {
+          v.workTimer = 0;
+          this.completeVillagerTask(v);
+          v.pauseTimer = 0.8;
+        }
+        continue;
+      }
+
       if (v.pauseTimer > 0) {
         v.pauseTimer -= dt;
         v.bodyMesh.position.y = 0;
@@ -4047,14 +5895,38 @@ export class PocketWorldController {
         v.rightArm.rotation.x = THREE.MathUtils.lerp(v.rightArm.rotation.x, 0, dt * 8);
         v.headGroup.rotation.x = THREE.MathUtils.lerp(v.headGroup.rotation.x, 0, dt * 6);
         v.headGroup.rotation.y = Math.sin(elapsed * 2.2 + v.walkPhase) * 0.25;
+        if (v.pauseTimer <= 0 && (!v.taskKind || v.taskKind === 'idle')) {
+          if (!this.assignFunctionalJobIfAvailable(v)) {
+            v.headingToWell = !v.headingToWell;
+            v.targetDir = this.pickNextVillagerTarget(v.headingToWell, v.dir);
+            v.liveActivityLabel = `Strolling near ${v.assignment}`;
+          }
+        }
         continue;
       }
 
       const distToTarget = v.dir.distanceTo(v.targetDir);
-      if (distToTarget < 0.026) {
-        v.headingToWell = !v.headingToWell;
-        v.targetDir = this.pickNextVillagerTarget(v.headingToWell, v.dir);
-        v.pauseTimer = 0.9 + Math.random() * 1.4;
+      if (distToTarget < 0.032) {
+        if (v.taskKind && v.taskKind !== 'idle') {
+          v.workTimer = 1.8;
+          if (v.taskKind === 'watering_plot') {
+            v.liveActivityLabel = 'Watering dry garden bed';
+          } else if (v.taskKind === 'replanting_plot') {
+            v.liveActivityLabel = 'Sowing seeds in garden bed';
+          } else if (v.taskKind === 'tending_mill') {
+            v.liveActivityLabel = 'Tending the Grain Windmill';
+          } else if (v.taskKind === 'tending_hive') {
+            v.liveActivityLabel = 'Tending the Meadow Apiary';
+          }
+          continue;
+        }
+
+        if (!this.assignFunctionalJobIfAvailable(v)) {
+          v.headingToWell = !v.headingToWell;
+          v.targetDir = this.pickNextVillagerTarget(v.headingToWell, v.dir);
+          v.pauseTimer = 0.9 + Math.random() * 1.4;
+          v.liveActivityLabel = `Resting near ${v.assignment}`;
+        }
         v.stuckTimer = 0;
         continue;
       }
@@ -4062,14 +5934,12 @@ export class PocketWorldController {
       const prevDir = v.dir.clone();
       const surfBefore = this.terrain.getSurfacePointAndNormal(v.dir);
 
-      // Desired tangent direction toward target on local surface plane
       const desiredTangent = v.targetDir
         .clone()
         .sub(v.dir)
         .projectOnPlane(surfBefore.normal)
         .normalize();
 
-      // Compute smooth look-ahead obstacle avoidance steering vector around buildings, trees & fences
       const steerVec = desiredTangent.clone();
       const signHint = v.steerSign || 1;
 
@@ -4137,7 +6007,6 @@ export class PocketWorldController {
           const toObsNorm = toObs.clone().normalize();
           const approaching = toObsNorm.dot(desiredTangent);
 
-          // Steer around the building if it lies in our forward hemisphere or we are very close
           if (approaching > -0.15 || dObs < minClear + 0.014) {
             const tangentLeft = new THREE.Vector3()
               .crossVectors(surfBefore.normal, toObsNorm)
@@ -4161,7 +6030,6 @@ export class PocketWorldController {
         }
       }
 
-      // Also steer around the fenced sheep pasture corral
       const dPasture = v.dir.distanceTo(this.pastureCenter);
       const pastureClear = this.pastureRadius + villagerRadius + 0.008;
       const pastureAvoid = pastureClear + 0.044;
@@ -4188,7 +6056,6 @@ export class PocketWorldController {
         }
       }
 
-      // Personal-space steering around other villagers
       for (const other of this.villagers) {
         if (other === v) continue;
         const dOther = v.dir.distanceTo(other.dir);
@@ -4207,17 +6074,21 @@ export class PocketWorldController {
         steerVec.copy(desiredTangent);
       }
 
-      // Advance along steered tangent vector
       v.dir.addScaledVector(steerVec, v.speed * dt).normalize();
-
-      // Enforce hard non-penetration constraints against all buildings, fences, water & cliffs
       this.resolveVillagerCollisions(v, bridgesAndDocks, prevDir);
 
-      // Watchdog: if blocked from making progress for too long, choose a new clear target
       const actualStep = v.dir.distanceTo(prevDir);
       if (actualStep < v.speed * dt * 0.18) {
         v.stuckTimer = (v.stuckTimer || 0) + dt;
         if (v.stuckTimer > 1.1) {
+          if (v.taskTargetId) {
+            const p = this.placedObjects.find((o) => o.id === v.taskTargetId);
+            if (p && p.reservedByVillagerId === v.id) {
+              p.reservedByVillagerId = null;
+            }
+          }
+          v.taskKind = 'idle';
+          v.taskTargetId = null;
           v.steerSign = -(v.steerSign || 1);
           v.headingToWell = !v.headingToWell;
           v.targetDir = this.pickNextVillagerTarget(v.headingToWell, v.dir);
@@ -4236,7 +6107,6 @@ export class PocketWorldController {
       const stride = Math.sin(v.walkPhase);
       const hop = Math.abs(stride) * 0.0032;
 
-      // Swing articulated legs & arms in opposition
       v.leftLeg.rotation.x = stride * 0.58;
       v.rightLeg.rotation.x = -stride * 0.58;
       v.leftArm.rotation.x = -stride * 0.46;
@@ -4278,7 +6148,6 @@ export class PocketWorldController {
         const invAlign = alignQuat.clone().invert();
         const localTangent = faceTangent.clone().applyQuaternion(invAlign);
         const targetYaw = Math.atan2(localTangent.x, localTangent.z);
-        // Smooth angular turn so villagers don't snap-spin around corners
         let diff = targetYaw - v.yaw;
         while (diff > Math.PI) diff -= Math.PI * 2;
         while (diff < -Math.PI) diff += Math.PI * 2;
@@ -4287,395 +6156,297 @@ export class PocketWorldController {
         v.mesh.quaternion.copy(alignQuat).multiply(yawQuat);
       }
     }
+  }
 
-    // 8. Update White Sheep grazing inside the fenced pasture & respecting all fences/structures
-    const pRight = new THREE.Vector3()
-      .crossVectors(UP_VEC, this.pastureCenter)
-      .normalize();
-    const pUp = new THREE.Vector3()
-      .crossVectors(this.pastureCenter, pRight)
-      .normalize();
+  // =========================================================================
+  // Save / Load / Export / Import / Reset Persistence
+  // =========================================================================
 
+  public serializeWorldSave(): SerializedWorldSaveV2 {
+    return {
+      version: SAVE_VERSION,
+      savedAt: Date.now(),
+      planetName: this.planetName,
+      dayCount: this.dayCount,
+      timeMode: this.timeMode,
+      timeOfDay: this.timeOfDay,
+      season: this.season,
+      seasonTimer: this.seasonTimer,
+      weatherPhase: this.weatherPhase,
+      weatherTimer: this.weatherTimer,
+      weatherOverride: this.weatherOverride,
+      reducedMotion: this.reducedMotion,
+      autoReplantEnabled: this.autoReplantEnabled,
+      coins: this.coins,
+      gardenPoints: this.gardenPoints,
+      seedsByCrop: { ...this.seedsByCrop },
+      resources: {
+        water: this.resources.water,
+        compost: this.resources.compost,
+        harvestTotal: this.resources.harvestTotal,
+      },
+      inventory: { ...this.inventory },
+      stats: { ...this.stats },
+      completedMilestones: Array.from(this.completedMilestones),
+      discoveredCrops: Array.from(this.discoveredCrops),
+      terrainRadii: this.terrain.uniqueVertices.map((uv) => uv.radius),
+      tilledFacets: this.terrain.facets.map((f) => f.isTilled),
+      placedObjects: this.placedObjects.map((o) => ({
+        id: o.id,
+        type: o.type,
+        dir: [o.dir.x, o.dir.y, o.dir.z],
+        yaw: o.yaw,
+        growth: o.growth,
+        targetGrowth: o.targetGrowth,
+        removable: o.removable,
+        cropType: o.cropType,
+        hasCrop: o.hasCrop,
+        harvested: o.harvested,
+        moisture: o.moisture,
+        composted: o.composted,
+        hasCloche: o.hasCloche,
+        isProcessing: o.isProcessing,
+        productionTimer: o.productionTimer,
+        storedOutput: o.storedOutput,
+        customTitle: o.customTitle,
+      })),
+      villagers: this.villagers.map((v) => ({
+        id: v.id,
+        name: v.name,
+        role: v.role,
+        assignment: v.assignment,
+        dir: [v.dir.x, v.dir.y, v.dir.z],
+        yaw: v.yaw,
+      })),
+      sheep: this.sheepList.map((s) => ({
+        id: s.id,
+        dir: [s.dir.x, s.dir.y, s.dir.z],
+        yaw: s.yaw,
+        inPasture: Boolean(s.inPasture),
+      })),
+    };
+  }
+
+  public saveGameManual(silent = false): boolean {
+    const save = this.serializeWorldSave();
+    const ok = saveWorldToStorage(save);
+    if (ok) {
+      this.lastSavedAt = save.savedAt;
+      if (!silent) {
+        soundEngine.playSelect();
+        this.showStatusMessage('Saved terrarium world to browser storage');
+      }
+      this.syncWorldStats();
+    }
+    return ok;
+  }
+
+  public exportSaveJson(): string {
+    return JSON.stringify(this.serializeWorldSave(), null, 2);
+  }
+
+  public importSaveJson(jsonStr: string): boolean {
+    try {
+      const parsed = JSON.parse(jsonStr);
+      const valid = validateWorldSave(parsed);
+      if (!valid) {
+        this.showStatusMessage('Invalid save file format — current world preserved');
+        return false;
+      }
+      this.restoreFromSerializedSave(valid);
+      saveWorldToStorage(valid);
+      soundEngine.playHarvest();
+      this.showStatusMessage('Restored terrarium world from save file');
+      this.syncWorldStats();
+      return true;
+    } catch {
+      this.showStatusMessage('Could not parse save JSON — current world preserved');
+      return false;
+    }
+  }
+
+  public resetWorldToDefault() {
+    clearWorldStorage();
+    this.clearCurrentWorldEntities();
+    this.planetName = 'Little Meadow';
+    this.coins = 32;
+    this.gardenPoints = 6;
+    this.seedsByCrop = { berry: 5, wheat: 5, pumpkin: 2 };
+    this.discoveredCrops = new Set(['berry', 'wheat']);
+    this.completedMilestones.clear();
+    this.autoReplantEnabled = false;
+    this.season = 'spring';
+    this.seasonTimer = 0;
+    this.weatherPhase = 'clear';
+    this.weatherTimer = WEATHER_PHASE_DURATIONS.clear;
+    this.weatherOverride = null;
+    this.resources = { seeds: 12, water: 18, compost: 4, harvestTotal: 6 };
+    this.inventory = { wheat: 2, pumpkin: 1, berry: 2, honey: 1, flour: 1 };
+    this.stats = { totalPlanted: 6, totalHarvested: 6, totalTended: 4 };
+    this.populateInitialWorld();
+    this.syncCanopyEmitters();
+    soundEngine.playSelect();
+    this.showStatusMessage('Reset terrarium to a fresh Little Meadow');
+    this.syncWorldStats();
+  }
+
+  private clearCurrentWorldEntities() {
+    for (const o of this.placedObjects) {
+      this.objectsGroup.remove(o.mesh);
+    }
+    for (const v of this.villagers) {
+      this.inhabitantsGroup.remove(v.mesh);
+    }
     for (const s of this.sheepList) {
-      s.grazeTimer -= dt;
-      if (s.grazeTimer <= 0) {
-        s.isGrazing = !s.isGrazing;
-        s.grazeTimer = s.isGrazing
-          ? 2.0 + Math.random() * 2.5
-          : 2.2 + Math.random() * 2.0;
-        if (!s.isGrazing) {
-          if (s.inPasture) {
-            // Pick a random grazing spot strictly inside the fenced sheep pasture corral
-            const maxR = this.pastureRadius - 0.025;
-            for (let attempt = 0; attempt < 12; attempt++) {
-              const angle = Math.random() * Math.PI * 2;
-              const r = (0.15 + Math.random() * 0.85) * maxR;
-              const candidate = this.pastureCenter
-                .clone()
-                .addScaledVector(pRight, Math.cos(angle) * r)
-                .addScaledVector(pUp, Math.sin(angle) * r)
-                .normalize();
-              if (this.isPositionClearOfObstacles(candidate, 0.012, true)) {
-                s.targetDir.copy(candidate);
-                break;
-              }
-            }
-          } else {
-            // Free-range sheep placed outside the pasture corral
-            for (let attempt = 0; attempt < 12; attempt++) {
-              const offset = new THREE.Vector3(
-                (Math.random() - 0.5) * 0.14,
-                (Math.random() - 0.5) * 0.14,
-                (Math.random() - 0.5) * 0.14,
-              );
-              const candidate = s.dir.clone().add(offset).normalize();
-              if (this.isPositionClearOfObstacles(candidate, 0.014, false)) {
-                s.targetDir.copy(candidate);
-                break;
-              }
-            }
-          }
-        }
-      }
-
-      // Cute wagging woolly tail
-      s.tailMesh.rotation.y = Math.sin(elapsed * 8.5 + s.walkPhase) * 0.32;
-
-      if (s.isGrazing) {
-        s.headGroup.rotation.x =
-          0.48 + Math.sin(elapsed * 7.0 + s.walkPhase) * 0.14;
-        for (const leg of s.legs) {
-          leg.rotation.x = THREE.MathUtils.lerp(leg.rotation.x, 0, dt * 8);
-        }
-      } else {
-        s.headGroup.rotation.x = THREE.MathUtils.lerp(
-          s.headGroup.rotation.x,
-          0.0,
-          dt * 6.0,
-        );
-        const dist = s.dir.distanceTo(s.targetDir);
-        if (dist > 0.008) {
-          const prevSheepDir = s.dir.clone();
-          s.dir
-            .lerp(s.targetDir, (s.speed * dt) / Math.max(dist, 0.01))
-            .normalize();
-
-          // Enforce fence rail collision, pasture containment, building collision & flock separation
-          const hitBoundary = this.resolveSheepCollisions(s, prevSheepDir);
-          if (hitBoundary) {
-            // Pick a fresh grazing point away from the fence/obstacle
-            s.targetDir.copy(
-              s.inPasture ? this.pastureCenter : prevSheepDir,
-            );
-          }
-
-          s.walkPhase += dt * 12.0;
-          const stride = Math.sin(s.walkPhase);
-          const hop = Math.abs(stride) * 0.0025;
-
-          // Quadruped diagonal trot leg swing
-          if (s.legs.length === 4) {
-            s.legs[0].rotation.x = stride * 0.45;
-            s.legs[1].rotation.x = -stride * 0.45;
-            s.legs[2].rotation.x = -stride * 0.45;
-            s.legs[3].rotation.x = stride * 0.45;
-          }
-
-          const surf = this.terrain.getSurfacePointAndNormal(s.dir);
-          s.mesh.position.copy(surf.point).addScaledVector(surf.normal, hop);
-
-          const moveTangent = s.targetDir
-            .clone()
-            .sub(s.dir)
-            .projectOnPlane(surf.normal)
-            .normalize();
-          const alignQuat = new THREE.Quaternion().setFromUnitVectors(
-            UP_VEC,
-            surf.normal,
-          );
-          if (moveTangent.lengthSq() > 1e-5) {
-            const invAlign = alignQuat.clone().invert();
-            const localTangent = moveTangent.clone().applyQuaternion(invAlign);
-            const targetYaw = Math.atan2(localTangent.x, localTangent.z);
-            let diff = targetYaw - s.yaw;
-            while (diff > Math.PI) diff -= Math.PI * 2;
-            while (diff < -Math.PI) diff += Math.PI * 2;
-            s.yaw += diff * Math.min(1.0, dt * 8.0);
-          }
-          const yawQuat = new THREE.Quaternion().setFromAxisAngle(UP_VEC, s.yaw);
-          s.mesh.quaternion.copy(alignQuat).multiply(yawQuat);
-        } else {
-          s.isGrazing = true;
-          s.grazeTimer = 1.8 + Math.random() * 2.2;
-        }
-      }
+      this.inhabitantsGroup.remove(s.mesh);
     }
-
-    // 9. Update Sailboats bobbing & sailing across turquoise seas (avoiding docks, bridges & shorelines)
     for (const b of this.sailboats) {
-      b.lanternMat.emissiveIntensity = 0.2 + warmGlowFactor * 2.3;
-
-      const dist = b.dir.distanceTo(b.targetDir);
-      if (dist < 0.03) {
-        b.targetDir = this.pickRandomWaterTarget(b.dir);
-      } else {
-        const nextDir = b.dir
-          .clone()
-          .lerp(b.targetDir, (b.speed * dt) / Math.max(dist, 0.01))
-          .normalize();
-        const surf = this.terrain.getSurfacePointAndNormal(nextDir);
-        const hitsPier = bridgesAndDocks.some(
-          (pier) => pier.dir.distanceTo(nextDir) < 0.052,
-        );
-        const hitsOtherBoat = this.sailboats.some(
-          (other) => other !== b && other.dir.distanceTo(nextDir) < 0.048,
-        );
-
-        if (surf.isWater && !hitsPier && !hitsOtherBoat) {
-          const tangent = b.targetDir
-            .clone()
-            .sub(b.dir)
-            .projectOnPlane(nextDir)
-            .normalize();
-          if (tangent.lengthSq() > 1e-5) {
-            b.yaw = Math.atan2(tangent.x, tangent.z);
-          }
-          b.dir.copy(nextDir);
-        } else {
-          b.targetDir = this.pickRandomWaterTarget(b.dir);
-        }
-      }
-
-      const bobOffset = Math.sin(elapsed * 2.6 + b.bobPhase) * 0.0022;
-      this.orientObjectOnSurface(b.mesh, b.dir, b.yaw, bobOffset, true);
-      b.hullGroup.rotation.z = Math.sin(elapsed * 2.1 + b.bobPhase) * 0.085;
-      b.hullGroup.rotation.x = Math.cos(elapsed * 1.8 + b.bobPhase) * 0.05;
+      this.inhabitantsGroup.remove(b.mesh);
     }
-
-    // 10. Update Paddling Swans & Ducks with expanding water ripple rings (avoiding docks & boats)
     for (const d of this.ducks) {
-      const dist = d.dir.distanceTo(d.targetDir);
-      if (dist < 0.025) {
-        d.targetDir = this.pickRandomWaterTarget(d.dir);
-      } else {
-        const nextDir = d.dir
-          .clone()
-          .lerp(d.targetDir, (d.speed * dt) / Math.max(dist, 0.01))
-          .normalize();
-        const surf = this.terrain.getSurfacePointAndNormal(nextDir);
-        const hitsPier = bridgesAndDocks.some(
-          (pier) => pier.dir.distanceTo(nextDir) < 0.044,
-        );
-        const hitsBoat = this.sailboats.some(
-          (boat) => boat.dir.distanceTo(nextDir) < 0.045,
-        );
-
-        if (surf.isWater && !hitsPier && !hitsBoat) {
-          const tangent = d.targetDir
-            .clone()
-            .sub(d.dir)
-            .projectOnPlane(nextDir)
-            .normalize();
-          if (tangent.lengthSq() > 1e-5) {
-            d.yaw = Math.atan2(tangent.x, tangent.z);
-          }
-          d.dir.copy(nextDir);
-        } else {
-          d.targetDir = this.pickRandomWaterTarget(d.dir);
-        }
-      }
-
-      const bobOffset = Math.sin(elapsed * 3.4 + d.bobPhase) * 0.0012;
-      this.orientObjectOnSurface(d.mesh, d.dir, d.yaw, bobOffset, true);
-
-      d.rippleRings.forEach((ring, idx) => {
-        const rippleCycle = (elapsed * 0.85 + idx * 0.5 + d.bobPhase) % 1.0;
-        const scale = 0.8 + rippleCycle * 1.45;
-        ring.scale.setScalar(scale);
-        (ring.material as THREE.MeshBasicMaterial).opacity =
-          (1.0 - rippleCycle) * 0.45;
-      });
+      this.inhabitantsGroup.remove(d.mesh);
     }
-
-    // 11. Update Hot Air Balloons floating in the upper atmosphere
     for (const bal of this.balloons) {
-      const qStep = new THREE.Quaternion().setFromAxisAngle(
-        bal.orbitAxis,
-        bal.orbitSpeed * dt,
-      );
-      bal.currentDir.applyQuaternion(qStep).normalize();
-      const alt =
-        bal.baseAltitude + Math.sin(elapsed * 1.2 + bal.phase) * 0.018;
-      bal.mesh.position.copy(bal.currentDir).multiplyScalar(alt);
-      bal.mesh.quaternion.setFromUnitVectors(UP_VEC, bal.currentDir);
-
-      // Periodic golden burner flame puff
-      const burnerPulse =
-        Math.max(0, Math.sin(elapsed * 2.4 + bal.phase * 2.0)) * 1.8;
-      bal.burnerMat.emissiveIntensity = 0.7 + burnerPulse + warmGlowFactor * 1.1;
+      this.atmosphereGroup.remove(bal.mesh);
     }
-
-    // 12. Update Puffy Rain Clouds & Frosty Snow Clouds
     for (const c of this.clouds) {
-      const qStep = new THREE.Quaternion().setFromAxisAngle(
-        c.orbitAxis,
-        c.orbitSpeed * dt,
-      );
-      c.currentDir.applyQuaternion(qStep).normalize();
-      c.mesh.position.copy(c.currentDir).multiplyScalar(c.altitude);
-      c.mesh.quaternion.setFromUnitVectors(UP_VEC, c.currentDir);
+      this.atmosphereGroup.remove(c.mesh);
+    }
+    this.placedObjects = [];
+    this.villagers = [];
+    this.sheepList = [];
+    this.sailboats = [];
+    this.ducks = [];
+    this.balloons = [];
+    this.clouds = [];
+    this.selectedEntityId = null;
+  }
 
-      c.rainTimer -= dt;
-      if (c.rainTimer <= 0) {
-        c.isRaining = !c.isRaining;
-        c.rainTimer = c.isRaining
-          ? 5.2 + Math.random() * 2.5
-          : 6.5 + Math.random() * 4.5;
+  private restoreFromSerializedSave(save: SerializedWorldSaveV2) {
+    this.clearCurrentWorldEntities();
+    this.planetName = save.planetName || 'Little Meadow';
+    this.dayCount = save.dayCount || 1;
+    this.timeMode = save.timeMode || 'auto';
+    this.timeOfDay = save.timeOfDay ?? 0.24;
+    this.season = save.season || 'spring';
+    this.seasonTimer = save.seasonTimer || 0;
+    this.weatherPhase = save.weatherPhase || 'clear';
+    this.weatherTimer = save.weatherTimer || WEATHER_PHASE_DURATIONS.clear;
+    this.weatherOverride = save.weatherOverride ?? null;
+    this.reducedMotion = Boolean(save.reducedMotion);
+    this.autoReplantEnabled = Boolean(save.autoReplantEnabled);
+    this.coins = save.coins;
+    this.gardenPoints = save.gardenPoints;
+    this.seedsByCrop = { ...save.seedsByCrop };
+    this.resources = {
+      seeds:
+        (save.seedsByCrop.berry || 0) +
+        (save.seedsByCrop.wheat || 0) +
+        (save.seedsByCrop.pumpkin || 0),
+      water: save.resources.water,
+      compost: save.resources.compost,
+      harvestTotal: save.resources.harvestTotal,
+    };
+    this.inventory = { ...save.inventory };
+    this.stats = { ...save.stats };
+    this.completedMilestones = new Set(save.completedMilestones || []);
+    this.discoveredCrops = new Set(save.discoveredCrops || ['berry', 'wheat']);
+    this.lastSavedAt = save.savedAt || Date.now();
+
+    if (
+      Array.isArray(save.terrainRadii) &&
+      save.terrainRadii.length === this.terrain.uniqueVertices.length
+    ) {
+      for (let i = 0; i < save.terrainRadii.length; i++) {
+        this.terrain.uniqueVertices[i].radius = save.terrainRadii[i];
       }
+    }
+    if (
+      Array.isArray(save.tilledFacets) &&
+      save.tilledFacets.length === this.terrain.facets.length
+    ) {
+      for (let i = 0; i < save.tilledFacets.length; i++) {
+        this.terrain.facets[i].isTilled = Boolean(save.tilledFacets[i]);
+      }
+    }
+    this.terrain.refreshGeometryAndColors();
 
-      if (c.isSnow && c.snowPoints && c.snowMat) {
-        const targetSnowOpacity = c.isRaining ? 0.88 : 0.0;
-        c.snowMat.opacity = THREE.MathUtils.lerp(
-          c.snowMat.opacity,
-          targetSnowOpacity,
-          dt * 4.0,
+    for (const po of save.placedObjects) {
+      const dir = new THREE.Vector3(po.dir[0], po.dir[1], po.dir[2]).normalize();
+      if (po.type === 'plot') {
+        const plotEntity = this.placeGardenPlot(
+          po.cropType || 'wheat',
+          dir,
+          po.yaw,
+          po.growth,
+          po.moisture ?? 0.65,
+          Boolean(po.composted),
+          false,
+          {
+            id: po.id,
+            hasCrop: po.hasCrop ?? true,
+            harvested: Boolean(po.harvested),
+            hasCloche: Boolean(po.hasCloche),
+          },
         );
-        if (c.isRaining) {
-          c.snowPoints.position.y = -((elapsed * 0.14) % 0.06);
-          c.snowPoints.rotation.y = elapsed * 0.8;
-          this.terrain.applySnowAtDirection(c.currentDir, dt);
-        }
+        this.updatePlotVisuals(plotEntity);
       } else {
-        const targetRainOpacity = c.isRaining ? 0.65 : 0.0;
-        c.rainMat.opacity = THREE.MathUtils.lerp(
-          c.rainMat.opacity,
-          targetRainOpacity,
-          dt * 4.0,
+        const entity = this.placeStaticObject(
+          po.type,
+          dir,
+          po.yaw,
+          po.removable,
+          false,
         );
-
-        if (c.isRaining) {
-          c.rainLines.position.y = -((elapsed * 0.38) % 0.06);
-          this.terrain.applyRainAtDirection(c.currentDir, dt);
-
-          for (const obj of this.placedObjects) {
-            if (obj.type === 'oak' || obj.type === 'pine' || obj.type === 'palm') {
-              if (obj.dir.distanceTo(c.currentDir) < 0.28 && obj.targetGrowth < 1.38) {
-                obj.targetGrowth = Math.min(1.38, obj.targetGrowth + dt * 0.09);
-              }
-            }
-          }
-        }
+        entity.id = po.id;
+        entity.growth = po.growth;
+        entity.targetGrowth = po.targetGrowth;
+        entity.isProcessing = Boolean(po.isProcessing);
+        entity.productionTimer = po.productionTimer || 0;
+        entity.storedOutput = po.storedOutput || 0;
+        entity.customTitle = po.customTitle;
+        entity.mesh.scale.setScalar(po.growth);
       }
     }
 
-    // 13. Update Shooting Stars streaking across the upper orb sky
-    for (let i = this.shootingStars.length - 1; i >= 0; i--) {
-      const st = this.shootingStars[i];
-      st.age += dt;
-      if (st.age >= st.maxAge) {
-        this.atmosphereGroup.remove(st.mesh);
-        this.shootingStars.splice(i, 1);
-        continue;
-      }
-
-      const prevPos = st.currentDir.clone().multiplyScalar(st.altitude);
-      const qStep = new THREE.Quaternion().setFromAxisAngle(
-        st.orbitAxis,
-        st.speed * dt,
-      );
-      st.currentDir.applyQuaternion(qStep).normalize();
-      const nextPos = st.currentDir.clone().multiplyScalar(st.altitude);
-
-      st.mesh.position.copy(nextPos);
-      const velDir = nextPos.clone().sub(prevPos).normalize();
-      if (velDir.lengthSq() > 1e-5) {
-        const targetLook = nextPos.clone().add(velDir);
-        st.mesh.lookAt(targetLook);
-      }
-
-      const fade = 1.0 - Math.pow(st.age / st.maxAge, 2.0);
-      st.mesh.scale.setScalar(Math.max(0.01, fade));
-
-      st.sparkleTimer += dt;
-      if (st.sparkleTimer > 0.09) {
-        st.sparkleTimer = 0;
-        this.emitSparklesAtDir(st.currentDir, '#fff4b8', st.altitude);
+    for (const sv of save.villagers || []) {
+      const dir = new THREE.Vector3(sv.dir[0], sv.dir[1], sv.dir[2]).normalize();
+      this.spawnVillager(dir, false);
+      const created = this.villagers[this.villagers.length - 1];
+      if (created) {
+        created.id = sv.id;
+        created.name = sv.name;
+        created.role = sv.role;
+        created.assignment = sv.assignment;
+        created.yaw = sv.yaw;
       }
     }
 
-    // 14. Update Drifting Fireflies inside the glass orb in Night / Twilight mode
-    const fireflyAlpha = Math.max(0, nightFactor * 0.92 + twilightFactor * 0.35);
-    this.firefliesMat.opacity = fireflyAlpha;
-    if (fireflyAlpha > 0.01) {
-      const posAttr = this.firefliesPoints.geometry.attributes.position;
-      for (let i = 0; i < this.firefliesBasePositions.length; i++) {
-        const base = this.firefliesBasePositions[i];
-        const x = base.x + Math.sin(elapsed * 1.1 + i * 1.7) * 0.055;
-        const y = base.y + Math.cos(elapsed * 0.9 + i * 2.3) * 0.055;
-        const z = base.z + Math.sin(elapsed * 1.3 + i * 0.9) * 0.055;
-        posAttr.setXYZ(i, x, y, z);
+    for (const ss of save.sheep || []) {
+      const dir = new THREE.Vector3(ss.dir[0], ss.dir[1], ss.dir[2]).normalize();
+      this.spawnSheep(dir, false, ss.inPasture);
+      const created = this.sheepList[this.sheepList.length - 1];
+      if (created) {
+        created.id = ss.id;
+        created.yaw = ss.yaw;
       }
-      posAttr.needsUpdate = true;
     }
 
-    // 15. Update Sparkle Bursts
-    for (let i = this.sparkles.length - 1; i >= 0; i--) {
-      const b = this.sparkles[i];
-      b.age += dt;
-      if (b.age >= b.maxAge) {
-        this.effectsGroup.remove(b.points);
-        b.points.geometry.dispose();
-        (b.points.material as THREE.Material).dispose();
-        this.sparkles.splice(i, 1);
-        continue;
-      }
-      const posAttr = b.points.geometry.attributes.position;
-      for (let k = 0; k < b.velocities.length; k++) {
-        const vx = posAttr.getX(k) + b.velocities[k].x * dt;
-        const vy = posAttr.getY(k) + b.velocities[k].y * dt;
-        const vz = posAttr.getZ(k) + b.velocities[k].z * dt;
-        posAttr.setXYZ(k, vx, vy, vz);
-      }
-      posAttr.needsUpdate = true;
-      (b.points.material as THREE.PointsMaterial).opacity =
-        1.0 - b.age / b.maxAge;
-    }
-
-    // 16. Update Contextual Selection Ring on surface
-    if (this.selectedEntityId && !this.tourActive) {
-      const selObj = this.placedObjects.find((o) => o.id === this.selectedEntityId);
-      const selVil = !selObj
-        ? this.villagers.find((v) => v.id === this.selectedEntityId)
-        : undefined;
-      const targetDir = selObj ? selObj.dir : selVil ? selVil.dir : null;
-
-      if (targetDir) {
-        this.selectionRing.visible = true;
-        const surf = this.terrain.getSurfacePointAndNormal(targetDir);
-        const stickToSea = selObj?.type === 'dock' || selObj?.type === 'bridge';
-        this.orientObjectOnSurface(
-          this.selectionRing,
-          targetDir,
-          elapsed * (this.reducedMotion ? 0 : 0.45),
-          0.005,
-          stickToSea,
-        );
-        const scaleBase = selVil ? 0.68 : selObj?.type === 'plot' ? 0.96 : 1.18;
-        this.selectionRing.scale.setScalar(scaleBase);
-
-        if (elapsed - this.lastSelectionSyncTime > 0.85) {
-          this.lastSelectionSyncTime = elapsed;
-          this.syncWorldStats();
-        }
-      } else {
-        this.selectionRing.visible = false;
-      }
-    } else {
-      this.selectionRing.visible = false;
-    }
-
-    this.renderer.render(this.scene, this.camera);
-  };
+    // Spawn ambient water & sky life
+    this.spawnSailboat(new THREE.Vector3(0.62, -0.14, 0.77).normalize(), false);
+    this.spawnSailboat(new THREE.Vector3(-0.66, -0.14, -0.73).normalize(), false);
+    this.spawnDuckFlock(new THREE.Vector3(0.52, -0.22, 0.82).normalize(), false);
+    this.spawnBalloon(new THREE.Vector3(0.35, 0.52, 0.78).normalize(), false);
+    const cloudDirs = [
+      new THREE.Vector3(-0.28, 0.38, 0.88).normalize(),
+      new THREE.Vector3(0.68, 0.25, -0.68).normalize(),
+      new THREE.Vector3(-0.55, -0.48, -0.68).normalize(),
+    ];
+    cloudDirs.forEach((d, idx) => {
+      this.spawnCloud(d, false, 8.0 + idx * 4.0, false);
+    });
+    this.syncCloudsToSharedWeather();
+  }
 
   public selectFirstEntityOfKind(kind: 'plot' | 'building' | 'villager') {
     this.activeTool = null;
@@ -4938,12 +6709,31 @@ export class PocketWorldController {
   public dispose() {
     if (this.animFrameId !== null) {
       cancelAnimationFrame(this.animFrameId);
+      this.animFrameId = null;
+    }
+    if (this.timerFrameId !== null) {
+      window.clearTimeout(this.timerFrameId);
+      this.timerFrameId = null;
+    }
+    if (this.statusMessageTimer !== null) {
+      window.clearTimeout(this.statusMessageTimer);
+    }
+    this.ambientAudio.dispose();
+    if (this.pixelFx) {
+      this.pixelFx.dispose();
     }
     const cleanup = (this as unknown as { _cleanup?: () => void })._cleanup;
     if (cleanup) cleanup();
-    if (this.renderer.domElement && this.renderer.domElement.parentNode) {
-      this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
+    if (this.renderer) {
+      if (this.renderer.domElement && this.renderer.domElement.parentNode) {
+        this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
+      }
+      this.renderer.dispose();
+      this.renderer = null;
     }
-    this.renderer.dispose();
+    if (this.fallbackCanvas && this.fallbackCanvas.parentNode) {
+      this.fallbackCanvas.parentNode.removeChild(this.fallbackCanvas);
+      this.fallbackCanvas = null;
+    }
   }
 }

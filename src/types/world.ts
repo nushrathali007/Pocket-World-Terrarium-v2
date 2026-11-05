@@ -1,25 +1,37 @@
-export type DockCategory = 'plant' | 'tend' | 'harvest' | 'build';
+import {
+  PlotLifecycleState,
+  ProgressionTierId,
+  SeasonId,
+  WeatherPhase,
+} from '../config/farmConfig';
+
+export type {
+  PlotLifecycleState,
+  ProgressionTierId,
+  SeasonId,
+  WeatherPhase,
+};
 
 export type CropType = 'wheat' | 'pumpkin' | 'berry';
 
+export type DockCategory = 'plant' | 'tend' | 'harvest' | 'build';
+
 export type ToolId =
-  // 1. PLANT category (Seeds & Flora)
+  | 'prepare_bed'
   | 'wheat_seed'
   | 'pumpkin_seed'
   | 'berry_seed'
   | 'flower'
   | 'tree'
-  // 2. TEND category (Watering, Composting, Pollination & Weather Care)
   | 'water_can'
   | 'compost'
+  | 'greenhouse_bell'
   | 'cloud'
   | 'beehive'
   | 'sheep'
-  // 3. HARVEST category (Gathering & Pruning)
   | 'harvest_basket'
   | 'harvest_all'
   | 'remove'
-  // 4. BUILD category (Cottages, Landmarks, Coastal & Terrain)
   | 'house'
   | 'windmill'
   | 'lighthouse'
@@ -28,23 +40,29 @@ export type ToolId =
   | 'lantern'
   | 'dock'
   | 'sailboat'
+  | 'duck'
   | 'villager'
+  | 'balloon'
+  | 'snowcloud'
+  | 'rainbow'
+  | 'shootingstar'
   | 'raise'
   | 'lower'
-  // Additional legacy/scenic tools supported by controller
   | 'mountain'
-  | 'lake'
-  | 'duck'
-  | 'balloon'
-  | 'rainbow'
-  | 'snowcloud'
-  | 'shootingstar';
+  | 'lake';
 
 export type CameraViewId = 'orb' | 'surface' | 'orbit' | 'village';
 
 export type TimeMode = 'auto' | 'day' | 'twilight' | 'night';
 
-export type WeatherSummary = 'Clear Breeze' | 'Gentle Rain' | 'Soft Snow';
+export type WeatherMode = 'clear' | 'sunny' | 'rain' | 'snow';
+
+export type WeatherSummary =
+  | 'Clear Breeze'
+  | 'Gathering Clouds'
+  | 'Gentle Rain'
+  | 'Fresh After-Rain'
+  | 'Soft Snow';
 
 export type VillagerRole =
   | 'Gardener'
@@ -60,50 +78,69 @@ export type VillagerAssignment =
   | 'Village Commons'
   | 'Coastal Pier';
 
-export interface SelectedPlotInfo {
-  kind: 'plot';
-  id: string;
-  cropType: CropType;
-  cropLabel: string;
-  stage: 'Sprouting' | 'Growing' | 'Ripe';
-  growthPct: number;
-  moisturePct: number;
-  composted: boolean;
-  pollinated: boolean;
-}
-
-export interface SelectedBuildingInfo {
-  kind: 'building';
-  id: string;
-  buildingType: string;
-  title: string;
-  subtitle: string;
-  harmonyBonus: string;
-  actionLabel: string;
-  actionDescription: string;
-  removable: boolean;
-}
-
-export interface SelectedVillagerInfo {
-  kind: 'villager';
-  id: string;
-  name: string;
-  role: VillagerRole;
-  assignment: VillagerAssignment;
-  activity: string;
-}
-
-export type SelectedEntityInfo =
-  | SelectedPlotInfo
-  | SelectedBuildingInfo
-  | SelectedVillagerInfo;
-
 export interface HarvestFeedbackBatch {
   wheat: number;
   pumpkin: number;
   berry: number;
   honey: number;
   flour: number;
+}
+
+export type SelectedEntityInfo =
+  | {
+      kind: 'plot';
+      id: string;
+      cropType: CropType;
+      cropLabel: string;
+      hasCrop: boolean;
+      lifecycleState: PlotLifecycleState;
+      stage: string;
+      growthPct: number;
+      moisturePct: number;
+      composted: boolean;
+      pollinated: boolean;
+      hasCloche: boolean;
+      pausedByCold: boolean;
+      reservedByVillagerName?: string;
+    }
+  | {
+      kind: 'building';
+      id: string;
+      buildingType: string;
+      title: string;
+      subtitle: string;
+      harmonyBonus: string;
+      actionLabel: string;
+      actionDescription: string;
+      canPerformAction: boolean;
+      secondaryActionLabel?: string;
+      canPerformSecondaryAction?: boolean;
+      productionProgress?: number; // 0..100
+      storedOutput?: number;
+      maxStorage?: number;
+      removable: boolean;
+    }
+  | {
+      kind: 'villager';
+      id: string;
+      name: string;
+      role: VillagerRole;
+      assignment: VillagerAssignment;
+      activity: string;
+    };
+
+export interface ToolDefinition {
+  id: ToolId;
+  label: string;
+  shortLabel: string;
+  category: DockCategory;
+  description: string;
+  accentBg: string;
+  accentBorder: string;
+  accentText: string;
+  instantAction?: boolean;
+  coinCost?: number;
+  requiredTier?: ProgressionTierId;
 }
 
 export interface WorldState {
@@ -114,14 +151,29 @@ export interface WorldState {
   activeTool: ToolId | null;
   activeView: CameraViewId;
   timeMode: TimeMode;
-  /** 0..1 where 0.25 = warm noon/afternoon, 0.52 = blue twilight, 0.78 = deep night */
   timeOfDay: number;
   weatherSummary: WeatherSummary;
+  weatherPhase: WeatherPhase;
+  weatherOverride: WeatherPhase | null;
+  season: SeasonId;
   tourActive: boolean;
   tourElapsed: number;
   tourPhase: string;
   reducedMotion: boolean;
   selectedEntity: SelectedEntityInfo | null;
+  coins: number;
+  gardenPoints: number;
+  progressionTier: ProgressionTierId;
+  progressionTierLabel: string;
+  nextTierLabel: string | null;
+  nextTierPoints: number | null;
+  autoReplantUnlocked: boolean;
+  autoReplantEnabled: boolean;
+  canClaimFreeSeeds: boolean;
+  seedsByCrop: Record<CropType, number>;
+  completedMilestones: string[];
+  statusMessage: string | null;
+  lastSavedAt: number | null;
   resources: {
     seeds: number;
     water: number;
@@ -156,290 +208,300 @@ export interface WorldState {
   };
 }
 
-export interface ToolDefinition {
-  id: ToolId;
-  label: string;
-  shortLabel: string;
-  category: DockCategory;
-  accentBg: string;
-  accentBorder: string;
-  accentText: string;
-  description: string;
-  instantAction?: boolean;
-}
-
-export const DOCK_CATEGORIES: {
-  id: DockCategory;
-  label: string;
-  subtitle: string;
-}[] = [
-  {
-    id: 'plant',
-    label: 'Plant',
-    subtitle: 'Sow crop plots, meadow blossoms, and saplings',
-  },
-  {
-    id: 'tend',
-    label: 'Tend',
-    subtitle: 'Water soil, enrich with compost, and nurture life',
-  },
-  {
-    id: 'harvest',
-    label: 'Harvest',
-    subtitle: 'Gather ripe crops or gently prune the land',
-  },
-  {
-    id: 'build',
-    label: 'Build',
-    subtitle: 'Place cozy cottages, landmarks, and shape terrain',
-  },
+export const DOCK_CATEGORIES: { id: DockCategory; label: string }[] = [
+  { id: 'plant', label: 'Plant' },
+  { id: 'tend', label: 'Tend' },
+  { id: 'harvest', label: 'Harvest' },
+  { id: 'build', label: 'Build' },
 ];
 
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
-  // ===========================================================================
-  // 1. PLANT (Seeds & Flora)
-  // ===========================================================================
+  // 1. PLANT
   {
-    id: 'wheat_seed',
-    label: 'Golden Wheat',
-    shortLabel: 'Wheat',
+    id: 'prepare_bed',
+    label: 'Prepare Soil Bed',
+    shortLabel: 'Soil Bed',
     category: 'plant',
-    accentBg: 'bg-[#f7ebc6]',
-    accentBorder: 'border-[#d9be72]',
-    accentText: 'text-[#59440e]',
-    description: 'Plant a neat garden plot of golden grain stalks',
-  },
-  {
-    id: 'pumpkin_seed',
-    label: 'Sunlit Pumpkin',
-    shortLabel: 'Pumpkin',
-    category: 'plant',
-    accentBg: 'bg-[#fde2c8]',
-    accentBorder: 'border-[#e6a46e]',
-    accentText: 'text-[#69330c]',
-    description: 'Plant a warm patch of heirloom pumpkins and vines',
+    description: 'Shape a cedar-framed garden bed ready for seeds (4 Coins)',
+    accentBg: 'bg-[#f3e6d3]',
+    accentBorder: 'border-[#c9a982]',
+    accentText: 'text-[#52391e]',
+    coinCost: 4,
+    requiredTier: 'first_sprouts',
   },
   {
     id: 'berry_seed',
-    label: 'Sweet Berries',
+    label: 'Sweet Berry Seeds',
     shortLabel: 'Berries',
     category: 'plant',
-    accentBg: 'bg-[#f7dce4]',
-    accentBorder: 'border-[#de9ab0]',
-    accentText: 'text-[#662038]',
-    description: 'Plant a berry bush plot that ripens with sweet fruit',
+    description: 'Sow ruby berry bushes (4m growth, uses 1 Berry Seed)',
+    accentBg: 'bg-[#fae1e6]',
+    accentBorder: 'border-[#dfa0ae]',
+    accentText: 'text-[#691e30]',
+    requiredTier: 'first_sprouts',
+  },
+  {
+    id: 'wheat_seed',
+    label: 'Golden Wheat Seeds',
+    shortLabel: 'Wheat',
+    category: 'plant',
+    description: 'Sow golden grain stalks for the mill (8m growth, uses 1 Wheat Seed)',
+    accentBg: 'bg-[#faefd4]',
+    accentBorder: 'border-[#dfc278]',
+    accentText: 'text-[#5e440e]',
+    requiredTier: 'first_sprouts',
+  },
+  {
+    id: 'pumpkin_seed',
+    label: 'Autumn Pumpkin Seeds',
+    shortLabel: 'Pumpkin',
+    category: 'plant',
+    description: 'Sow heirloom harvest pumpkins (12m growth, uses 1 Pumpkin Seed)',
+    accentBg: 'bg-[#fce6d4]',
+    accentBorder: 'border-[#e3ad82]',
+    accentText: 'text-[#66300e]',
+    requiredTier: 'kitchen_garden',
   },
   {
     id: 'flower',
-    label: 'Wildflowers',
+    label: 'Meadow Wildflowers',
     shortLabel: 'Flowers',
     category: 'plant',
-    accentBg: 'bg-[#f2dff7]',
-    accentBorder: 'border-[#cfa4dc]',
-    accentText: 'text-[#52265c]',
-    description: 'Scatter pastel meadow blossoms for bees and villagers',
+    description: 'Nectar blossoms that boost nearby beehive honey (5 Coins)',
+    accentBg: 'bg-[#f7e2ec]',
+    accentBorder: 'border-[#d9a7c0]',
+    accentText: 'text-[#5c2240]',
+    coinCost: 5,
+    requiredTier: 'first_sprouts',
   },
   {
     id: 'tree',
-    label: 'Sapling Tree',
-    shortLabel: 'Sapling',
+    label: 'Woodland Tree',
+    shortLabel: 'Tree',
     category: 'plant',
+    description: 'Plant an oak, pine, or coastal palm tree (8 Coins)',
     accentBg: 'bg-[#dff0d8]',
-    accentBorder: 'border-[#a2cc9b]',
-    accentText: 'text-[#264d22]',
-    description: 'Plant oaks on hills, pines on peaks, or coastal palms',
+    accentBorder: 'border-[#a6cfa0]',
+    accentText: 'text-[#23451e]',
+    coinCost: 8,
+    requiredTier: 'first_sprouts',
   },
 
-  // ===========================================================================
-  // 2. TEND (Watering, Composting, Pollination & Care)
-  // ===========================================================================
+  // 2. TEND
   {
     id: 'water_can',
     label: 'Watering Can',
     shortLabel: 'Water',
     category: 'tend',
+    description: 'Hydrate dry garden beds so crops grow steadily (-1 Water)',
     accentBg: 'bg-[#d9eef7]',
     accentBorder: 'border-[#91c4de]',
     accentText: 'text-[#1b4c66]',
-    description: 'Hydrate garden plots and nourish nearby trees',
+    requiredTier: 'first_sprouts',
   },
   {
     id: 'compost',
     label: 'Rich Compost',
     shortLabel: 'Compost',
     category: 'tend',
+    description: 'Enrich plot soil for +25% faster growth and +1 harvest yield (-1 Compost)',
     accentBg: 'bg-[#ebe0d0]',
     accentBorder: 'border-[#bfa684]',
     accentText: 'text-[#4d3920]',
-    description: 'Enrich plot soil to double harvest yield and speed growth',
+    requiredTier: 'kitchen_garden',
   },
   {
-    id: 'cloud',
-    label: 'Rain Cloud',
-    shortLabel: 'Rain',
+    id: 'greenhouse_bell',
+    label: 'Glass Cloche',
+    shortLabel: 'Cloche',
     category: 'tend',
-    accentBg: 'bg-[#e1ecf7]',
-    accentBorder: 'border-[#a4c2e3]',
-    accentText: 'text-[#264669]',
-    description: 'Summon a gentle rain cloud that waters plots along its path',
+    description: 'Fit a miniature glass bell over a plot so crops grow during winter snow (14 Coins)',
+    accentBg: 'bg-[#e0f2f7]',
+    accentBorder: 'border-[#96c8d6]',
+    accentText: 'text-[#1c4b59]',
+    coinCost: 14,
+    requiredTier: 'flourishing_terrarium',
   },
   {
     id: 'beehive',
-    label: 'Apiary Hive',
+    label: 'Meadow Beehive',
     shortLabel: 'Beehive',
     category: 'tend',
-    accentBg: 'bg-[#fcf0c2]',
-    accentBorder: 'border-[#e3c76b]',
-    accentText: 'text-[#5e480d]',
-    description: 'Place a painted beehive that pollinates nearby garden plots',
+    description: 'Painted apiary that pollinates nearby crops and produces honey (18 Coins)',
+    accentBg: 'bg-[#faefd4]',
+    accentBorder: 'border-[#dfc278]',
+    accentText: 'text-[#5e440e]',
+    coinCost: 18,
+    requiredTier: 'kitchen_garden',
   },
   {
     id: 'sheep',
-    label: 'Grazing Sheep',
+    label: 'Meadow Sheep',
     shortLabel: 'Sheep',
     category: 'tend',
-    accentBg: 'bg-[#f2efe9]',
-    accentBorder: 'border-[#ccc5b8]',
-    accentText: 'text-[#474137]',
-    description: 'Add a woolly sheep that grazes the meadow',
+    description: 'Welcome a grazing woolly sheep to the meadow (14 Coins)',
+    accentBg: 'bg-[#f0ece1]',
+    accentBorder: 'border-[#cfc5b0]',
+    accentText: 'text-[#453d30]',
+    coinCost: 14,
+    requiredTier: 'kitchen_garden',
   },
 
-  // ===========================================================================
-  // 3. HARVEST (Basket, Gather All & Prune)
-  // ===========================================================================
+  // 3. HARVEST
   {
     id: 'harvest_basket',
     label: 'Harvest Basket',
-    shortLabel: 'Basket',
+    shortLabel: 'Harvest',
     category: 'harvest',
+    description: 'Click a ripe garden plot or ready beehive to collect produce',
     accentBg: 'bg-[#f7e8c8]',
     accentBorder: 'border-[#dbb872]',
     accentText: 'text-[#5c400e]',
-    description: 'Click a plot or beehive to gather ripe crops and honey',
+    requiredTier: 'first_sprouts',
   },
   {
     id: 'harvest_all',
     label: 'Gather All Ripe',
     shortLabel: 'Gather All',
     category: 'harvest',
-    accentBg: 'bg-[#dcedd4]',
-    accentBorder: 'border-[#9ec78d]',
-    accentText: 'text-[#23471b]',
-    description: 'Collect all ripe plots and honey across the planet at once',
+    description: 'Harvest every ripe crop and ready honey across the planet at once',
+    accentBg: 'bg-[#dff0d8]',
+    accentBorder: 'border-[#a6cfa0]',
+    accentText: 'text-[#23451e]',
     instantAction: true,
+    requiredTier: 'first_sprouts',
   },
   {
     id: 'remove',
-    label: 'Prune & Clear',
-    shortLabel: 'Prune',
+    label: 'Clear Object',
+    shortLabel: 'Clear',
     category: 'harvest',
+    description: 'Gently clear a removable plot or structure from the planet',
     accentBg: 'bg-[#f7dede]',
-    accentBorder: 'border-[#dfa4a4]',
+    accentBorder: 'border-[#dba4a4]',
     accentText: 'text-[#692626]',
-    description: 'Gently clear a plot, plant, or structure from the surface',
+    requiredTier: 'first_sprouts',
   },
 
-  // ===========================================================================
-  // 4. BUILD (Village Structures, Paths, Boats & Terrain)
-  // ===========================================================================
-  {
-    id: 'house',
-    label: 'Pastel Cottage',
-    shortLabel: 'Cottage',
-    category: 'build',
-    accentBg: 'bg-[#fce4d6]',
-    accentBorder: 'border-[#ebb69b]',
-    accentText: 'text-[#6e3820]',
-    description: 'Build a cozy cottage with roof tiles and two villagers',
-  },
+  // 4. BUILD
   {
     id: 'windmill',
     label: 'Grain Windmill',
     shortLabel: 'Windmill',
     category: 'build',
-    accentBg: 'bg-[#fdf2d0]',
-    accentBorder: 'border-[#e5cc87]',
-    accentText: 'text-[#665014]',
-    description: 'Erect a white windmill with turning canvas sails',
+    description: 'Timber mill that grinds 2 Wheat into artisan Flour (28 Coins)',
+    accentBg: 'bg-[#faefd4]',
+    accentBorder: 'border-[#dfc278]',
+    accentText: 'text-[#5e440e]',
+    coinCost: 28,
+    requiredTier: 'village_farm',
   },
   {
-    id: 'campfire',
-    label: 'Hearth Campfire',
-    shortLabel: 'Campfire',
+    id: 'house',
+    label: 'Pastel Cottage',
+    shortLabel: 'Cottage',
     category: 'build',
-    accentBg: 'bg-[#fde2c8]',
-    accentBorder: 'border-[#eba972]',
-    accentText: 'text-[#70360f]',
-    description: 'Light a warm stone campfire where villagers gather at dusk',
-  },
-  {
-    id: 'lantern',
-    label: 'Lantern Path',
-    shortLabel: 'Lantern',
-    category: 'build',
-    accentBg: 'bg-[#fef0c9]',
-    accentBorder: 'border-[#e5c777]',
-    accentText: 'text-[#634b10]',
-    description: 'Place a wrought-iron streetlamp and cobblestone path',
-  },
-  {
-    id: 'dock',
-    label: 'Pier & Bridge',
-    shortLabel: 'Pier',
-    category: 'build',
-    accentBg: 'bg-[#efe4d4]',
-    accentBorder: 'border-[#cbb393]',
-    accentText: 'text-[#543d22]',
-    description: 'Build a shoreline pier or an arched footbridge over water',
-  },
-  {
-    id: 'lighthouse',
-    label: 'Lighthouse',
-    shortLabel: 'Beacon',
-    category: 'build',
-    accentBg: 'bg-[#fadadd]',
-    accentBorder: 'border-[#e59fa6]',
-    accentText: 'text-[#70232b]',
-    description: 'Build a striped coastal lighthouse with sweeping beam',
-  },
-  {
-    id: 'sailboat',
-    label: 'Sailboat',
-    shortLabel: 'Boat',
-    category: 'build',
-    accentBg: 'bg-[#d6eff7]',
-    accentBorder: 'border-[#8ec9de]',
-    accentText: 'text-[#1c5166]',
-    description: 'Launch a wooden sailboat on the turquoise sea',
+    description: 'Timber-frame home that welcomes 2 villagers (22 Coins)',
+    accentBg: 'bg-[#fce6d4]',
+    accentBorder: 'border-[#e3ad82]',
+    accentText: 'text-[#66300e]',
+    coinCost: 22,
+    requiredTier: 'village_farm',
   },
   {
     id: 'villager',
-    label: 'Welcome Villager',
+    label: 'Invite Villager',
     shortLabel: 'Villager',
     category: 'build',
-    accentBg: 'bg-[#fde8c8]',
-    accentBorder: 'border-[#e6be83]',
-    accentText: 'text-[#664414]',
-    description: 'Invite a new villager to help tend plots and mills',
+    description: 'Welcome a helpful Gardener, Miller, or Beekeeper (20 Coins)',
+    accentBg: 'bg-[#dff0d8]',
+    accentBorder: 'border-[#a6cfa0]',
+    accentText: 'text-[#23451e]',
+    coinCost: 20,
+    requiredTier: 'village_farm',
+  },
+  {
+    id: 'dock',
+    label: 'Timber Pier / Bridge',
+    shortLabel: 'Pier',
+    category: 'build',
+    description: 'Shoreline trading pier or arched bridge over water (24 Coins)',
+    accentBg: 'bg-[#ebe0d0]',
+    accentBorder: 'border-[#bfa684]',
+    accentText: 'text-[#4d3920]',
+    coinCost: 24,
+    requiredTier: 'village_farm',
+  },
+  {
+    id: 'lantern',
+    label: 'Lantern Post',
+    shortLabel: 'Lantern',
+    category: 'build',
+    description: 'Warm wrought-iron lamp that illuminates paths at night (8 Coins)',
+    accentBg: 'bg-[#faefd4]',
+    accentBorder: 'border-[#dfc278]',
+    accentText: 'text-[#5e440e]',
+    coinCost: 8,
+    requiredTier: 'first_sprouts',
+  },
+  {
+    id: 'campfire',
+    label: 'Stone Campfire',
+    shortLabel: 'Campfire',
+    category: 'build',
+    description: 'Evening hearth circle where villagers gather at dusk (10 Coins)',
+    accentBg: 'bg-[#fce6d4]',
+    accentBorder: 'border-[#e3ad82]',
+    accentText: 'text-[#66300e]',
+    coinCost: 10,
+    requiredTier: 'kitchen_garden',
+  },
+  {
+    id: 'lighthouse',
+    label: 'Coastal Lighthouse',
+    shortLabel: 'Lighthouse',
+    category: 'build',
+    description: 'Striped beacon tower with rotating night beam (26 Coins)',
+    accentBg: 'bg-[#fae1e6]',
+    accentBorder: 'border-[#dfa0ae]',
+    accentText: 'text-[#691e30]',
+    coinCost: 26,
+    requiredTier: 'flourishing_terrarium',
+  },
+  {
+    id: 'sailboat',
+    label: 'Wooden Sailboat',
+    shortLabel: 'Sailboat',
+    category: 'build',
+    description: 'Launch a lantern-lit skiff onto the turquoise sea (16 Coins)',
+    accentBg: 'bg-[#d9eef7]',
+    accentBorder: 'border-[#91c4de]',
+    accentText: 'text-[#1b4c66]',
+    coinCost: 16,
+    requiredTier: 'village_farm',
   },
   {
     id: 'raise',
-    label: 'Raise Meadow',
+    label: 'Raise Terrain',
     shortLabel: 'Raise',
     category: 'build',
-    accentBg: 'bg-[#e6eed6]',
-    accentBorder: 'border-[#b5c993]',
-    accentText: 'text-[#3b4f1d]',
-    description: 'Gently elevate terrain facets into grassy hills',
+    description: 'Gently elevate terrain facets into hills (2 Coins)',
+    accentBg: 'bg-[#dff0d8]',
+    accentBorder: 'border-[#a6cfa0]',
+    accentText: 'text-[#23451e]',
+    coinCost: 2,
+    requiredTier: 'first_sprouts',
   },
   {
     id: 'lower',
-    label: 'Carve Pond',
-    shortLabel: 'Pond',
+    label: 'Carve Pond Basin',
+    shortLabel: 'Lower',
     category: 'build',
-    accentBg: 'bg-[#d8edf2]',
-    accentBorder: 'border-[#96c9d6]',
-    accentText: 'text-[#20515e]',
-    description: 'Lower terrain facets to form tranquil turquoise water',
+    description: 'Lower terrain facets into tranquil water basins (2 Coins)',
+    accentBg: 'bg-[#d9eef7]',
+    accentBorder: 'border-[#91c4de]',
+    accentText: 'text-[#1b4c66]',
+    coinCost: 2,
+    requiredTier: 'first_sprouts',
   },
 ];

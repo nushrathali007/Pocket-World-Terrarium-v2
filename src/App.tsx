@@ -10,7 +10,9 @@ import {
   Check,
   CloudRain,
   CloudSnow,
+  Coins,
   Compass,
+  Download,
   Droplets,
   Eraser,
   Fan,
@@ -20,11 +22,14 @@ import {
   Home,
   LampFloor,
   Leaf,
+  Lock,
   Menu,
   Moon,
   Package,
   Play,
+  RotateCcw,
   Sailboat,
+  Save,
   Shovel,
   ShoppingBasket,
   SlidersHorizontal,
@@ -34,6 +39,7 @@ import {
   Sunset,
   TowerControl,
   Trees,
+  Upload,
   Users,
   Volume2,
   VolumeX,
@@ -41,6 +47,13 @@ import {
   Wind,
   X,
 } from 'lucide-react';
+import {
+  BUILDING_COSTS,
+  CROP_CONFIG,
+  MILESTONE_DEFINITIONS,
+  PROGRESSION_TIERS,
+  SELL_PRICES,
+} from './config/farmConfig';
 import { PocketWorldController } from './three/PocketWorldScene';
 import {
   CameraViewId,
@@ -53,6 +66,7 @@ import {
   ToolId,
   VillagerAssignment,
   VillagerRole,
+  WeatherPhase,
   WorldState,
 } from './types/world';
 import { soundEngine } from './utils/sound';
@@ -75,6 +89,17 @@ const VILLAGER_ASSIGNMENT_OPTIONS: VillagerAssignment[] = [
   'Coastal Pier',
 ];
 
+const TIER_ORDER = PROGRESSION_TIERS.map((t) => t.id);
+
+function isTierAtLeast(currentTier: string, requiredTier?: string): boolean {
+  if (!requiredTier) return true;
+  return TIER_ORDER.indexOf(currentTier as never) >= TIER_ORDER.indexOf(requiredTier as never);
+}
+
+function getTierTitle(tierId?: string): string {
+  return PROGRESSION_TIERS.find((t) => t.id === tierId)?.title || 'First Sprouts';
+}
+
 function renderCategoryIcon(category: DockCategory) {
   const cls = 'w-4 h-4 shrink-0';
   switch (category) {
@@ -92,10 +117,12 @@ function renderCategoryIcon(category: DockCategory) {
 function renderToolIcon(id: ToolId) {
   const cls = 'w-4 h-4 shrink-0';
   switch (id) {
+    case 'prepare_bed':
+      return <Shovel className={cls} />;
     case 'wheat_seed':
       return <Wheat className={cls} />;
     case 'pumpkin_seed':
-      return < Leaf className={cls} />;
+      return <Leaf className={cls} />;
     case 'berry_seed':
       return <Apple className={cls} />;
     case 'flower':
@@ -106,6 +133,8 @@ function renderToolIcon(id: ToolId) {
       return <Droplets className={cls} />;
     case 'compost':
       return <Shovel className={cls} />;
+    case 'greenhouse_bell':
+      return <Sparkles className={cls} />;
     case 'cloud':
       return <CloudRain className={cls} />;
     case 'beehive':
@@ -173,15 +202,32 @@ export default function App() {
     timeMode: 'auto',
     timeOfDay: 0.24,
     weatherSummary: 'Clear Breeze',
+    weatherPhase: 'clear',
+    weatherOverride: null,
+    season: 'spring',
     tourActive: false,
     tourElapsed: 0,
     tourPhase: '',
     reducedMotion: false,
     selectedEntity: null,
+    coins: 28,
+    gardenPoints: 18,
+    progressionTier: 'first_sprouts',
+    progressionTierLabel: 'First Sprouts',
+    nextTierLabel: 'Kitchen Garden',
+    nextTierPoints: 45,
+    autoReplantUnlocked: false,
+    autoReplantEnabled: false,
+    canClaimFreeSeeds: false,
+    seedsByCrop: {
+      berry: 5,
+      wheat: 4,
+      pumpkin: 2,
+    },
     resources: {
-      seeds: 14,
+      seeds: 11,
       water: 18,
-      compost: 8,
+      compost: 6,
       harvestTotal: 6,
     },
     inventory: {
@@ -198,7 +244,7 @@ export default function App() {
     },
     objectCounts: {
       plots: 6,
-      ripePlots: 3,
+      ripePlots: 2,
       houses: 10,
       trees: 24,
       windmills: 1,
@@ -210,6 +256,9 @@ export default function App() {
       boats: 3,
       beehives: 2,
     },
+    completedMilestones: [],
+    statusMessage: null,
+    lastSavedAt: null,
   });
 
   // Expandable dock state: only one category expanded at a time
@@ -225,6 +274,10 @@ export default function App() {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [ambientEnabled, setAmbientEnabled] = useState(false);
   const [soundVolume, setSoundVolume] = useState(0.45);
+
+  // Save/Import JSON panel inside Settings
+  const [showSaveTransfer, setShowSaveTransfer] = useState(false);
+  const [saveJsonBuffer, setSaveJsonBuffer] = useState('');
 
   // Grouped Harvest Feedback state (merges consecutive harvests into one subtle banner)
   const [harvestToast, setHarvestToast] = useState<HarvestFeedbackBatch | null>(
@@ -399,6 +452,9 @@ export default function App() {
           ? 'Starry Night'
           : 'Morning Dew';
 
+  const seasonLabel =
+    worldState.season.charAt(0).toUpperCase() + worldState.season.slice(1);
+
   // Format Grouped Harvest Toast copy
   const harvestSummaryParts: string[] = [];
   if (harvestToast) {
@@ -414,37 +470,39 @@ export default function App() {
       harvestSummaryParts.push(`+${harvestToast.flour} Flour`);
   }
 
-  // Milestones computed from live worldState
-  const milestones = [
-    {
-      id: 'gardener',
-      title: 'Meadow Gardener',
-      desc: 'Cultivate and tend garden plots across the terrarium',
-      current: worldState.stats.totalPlanted + worldState.stats.totalTended,
-      target: 12,
-    },
-    {
-      id: 'harvest',
-      title: 'Bountiful Basket',
-      desc: 'Gather ripe wheat, pumpkins, berries, and honey',
-      current: worldState.stats.totalHarvested,
-      target: 12,
-    },
-    {
-      id: 'pollinator',
-      title: 'Pollinator Sanctuary',
-      desc: 'Maintain meadow wildflowers and painted beehives',
-      current: worldState.objectCounts.flowers,
-      target: 8,
-    },
-    {
-      id: 'hamlet',
-      title: 'Peaceful Sanctuary',
-      desc: 'Reach 14 villagers living in harmony',
-      current: worldState.population,
-      target: 14,
-    },
-  ];
+  const totalPantryItems =
+    worldState.inventory.berry +
+    worldState.inventory.wheat +
+    worldState.inventory.pumpkin +
+    worldState.inventory.honey +
+    worldState.inventory.flour;
+
+  const totalCropProduce =
+    worldState.inventory.berry +
+    worldState.inventory.wheat +
+    worldState.inventory.pumpkin;
+
+  const getToolSubLabel = (toolId: ToolId, instantAction?: boolean): string => {
+    switch (toolId) {
+      case 'berry_seed':
+        return `${worldState.seedsByCrop.berry} pkt · ${CROP_CONFIG.berry.seedCoinCost}c`;
+      case 'wheat_seed':
+        return `${worldState.seedsByCrop.wheat} pkt · ${CROP_CONFIG.wheat.seedCoinCost}c`;
+      case 'pumpkin_seed':
+        return `${worldState.seedsByCrop.pumpkin} pkt · ${CROP_CONFIG.pumpkin.seedCoinCost}c`;
+      case 'water_can':
+        return `${worldState.resources.water}/20 Water`;
+      case 'compost':
+        return `${worldState.resources.compost} Compost`;
+      case 'harvest_all':
+        return `${worldState.objectCounts.ripePlots} Ripe`;
+      default: {
+        const coinCost = BUILDING_COSTS[toolId];
+        if (coinCost && coinCost > 0) return `${coinCost} Coins`;
+        return instantAction ? 'Instant' : 'Select';
+      }
+    }
+  };
 
   const transitionClass = worldState.reducedMotion
     ? ''
@@ -482,14 +540,14 @@ export default function App() {
       )}
 
       {/* =====================================================================
-          2. TOP COMPACT STATUS STRIP (Time, Weather, Resources & Menu Home)
+          2. TOP COMPACT STATUS STRIP (Time, Season/Weather, Resources & Menu)
       ===================================================================== */}
       {!worldState.tourActive && (
         <header
           aria-label="Terrarium status strip"
           className="fixed top-3 left-1/2 -translate-x-1/2 z-30 w-auto max-w-[96vw]"
         >
-          <div className="flex items-center gap-1.5 sm:gap-2.5 px-3 py-1.5 rounded-2xl bg-[#faf5ec] text-[#382f27] border border-[#e0d4c0] shadow-lg">
+          <div className="flex items-center gap-1.5 sm:gap-2 px-3 py-1.5 rounded-2xl bg-[#faf5ec] text-[#382f27] border border-[#e0d4c0] shadow-lg">
             {/* Planet Name */}
             <span className="font-display text-sm font-semibold text-[#2b221b] whitespace-nowrap px-1">
               {worldState.planetName}
@@ -499,7 +557,7 @@ export default function App() {
               ·
             </span>
 
-            {/* Time of Day (Click to gently cycle time preset) */}
+            {/* Day, Season & Time of Day */}
             <button
               type="button"
               onClick={() => controllerRef.current?.cycleTimeMode()}
@@ -513,22 +571,28 @@ export default function App() {
               ) : (
                 <Moon className="w-3.5 h-3.5 text-[#496594] shrink-0" />
               )}
-              <span className="font-mono-tabular">Day {worldState.dayCount}</span>
-              <span className="hidden sm:inline text-[#7a6b5a]">
-                · {timePhaseLabel}
+              <span className="font-mono-tabular">
+                Day {worldState.dayCount}
+              </span>
+              <span className="hidden md:inline text-[#7a6b5a]">
+                · {seasonLabel} · {timePhaseLabel}
               </span>
             </button>
 
-            {/* Weather (Click to gently cycle weather) */}
+            {/* Weather (Click to gently cycle weather or resume natural cycle) */}
             <button
               type="button"
               onClick={() => controllerRef.current?.cycleWeather()}
-              title="Click to change weather"
-              className="min-h-[36px] px-2 py-1 rounded-xl hidden md:flex items-center gap-1.5 text-xs font-medium text-[#4a3f34] hover:bg-[#efe6d8] cursor-pointer whitespace-nowrap"
+              title={
+                worldState.weatherOverride
+                  ? 'Scenic weather override active (click to cycle)'
+                  : 'Natural weather cycle (click to override)'
+              }
+              className="min-h-[36px] px-2 py-1 rounded-xl hidden lg:flex items-center gap-1.5 text-xs font-medium text-[#4a3f34] hover:bg-[#efe6d8] cursor-pointer whitespace-nowrap"
             >
-              {worldState.weatherSummary === 'Gentle Rain' ? (
+              {worldState.weatherPhase === 'rain' ? (
                 <CloudRain className="w-3.5 h-3.5 text-[#386fa4] shrink-0" />
-              ) : worldState.weatherSummary === 'Soft Snow' ? (
+              ) : worldState.weatherPhase === 'snow' ? (
                 <CloudSnow className="w-3.5 h-3.5 text-[#4a7c9b] shrink-0" />
               ) : (
                 <Wind className="w-3.5 h-3.5 text-[#4d7c43] shrink-0" />
@@ -540,17 +604,39 @@ export default function App() {
               ·
             </span>
 
-            {/* Compact Resources (Seeds, Water, Compost, Harvest) */}
+            {/* Compact Resources (Coins, Garden Points, Seeds, Water, Compost) */}
             <div
-              className="flex items-center gap-2.5 sm:gap-3 px-1 text-xs font-mono-tabular text-[#4a3f34] whitespace-nowrap"
+              className="flex items-center gap-2 sm:gap-2.5 px-1 text-xs font-mono-tabular text-[#4a3f34] whitespace-nowrap"
               aria-label="Available resources"
             >
               <span
                 className="flex items-center gap-1"
-                title="Seeds available for planting"
+                title="Coins for seeds, beds, and village structures"
+              >
+                <Coins className="w-3.5 h-3.5 text-[#b87b1c] shrink-0" />
+                <span className="hidden xl:inline text-[#6e5f4f]">Coins</span>
+                <strong className="font-semibold text-[#2b221b]">
+                  {worldState.coins}
+                </strong>
+              </span>
+
+              <span
+                className="hidden sm:flex items-center gap-1"
+                title={`Garden Points · Tier: ${worldState.progressionTierLabel}`}
+              >
+                <Award className="w-3.5 h-3.5 text-[#3e7535] shrink-0" />
+                <span className="hidden xl:inline text-[#6e5f4f]">GP</span>
+                <strong className="font-semibold text-[#2b221b]">
+                  {worldState.gardenPoints}
+                </strong>
+              </span>
+
+              <span
+                className="flex items-center gap-1"
+                title={`Seeds: ${worldState.seedsByCrop.berry} Berry, ${worldState.seedsByCrop.wheat} Wheat, ${worldState.seedsByCrop.pumpkin} Pumpkin`}
               >
                 <Sprout className="w-3.5 h-3.5 text-[#3f7036] shrink-0" />
-                <span className="hidden lg:inline text-[#6e5f4f]">Seeds</span>
+                <span className="hidden xl:inline text-[#6e5f4f]">Seeds</span>
                 <strong className="font-semibold text-[#2b221b]">
                   {worldState.resources.seeds}
                 </strong>
@@ -558,34 +644,23 @@ export default function App() {
 
               <span
                 className="flex items-center gap-1"
-                title="Water reserves for tending"
+                title="Watering can reserves (refill at Stone Well or Pond)"
               >
                 <Droplets className="w-3.5 h-3.5 text-[#2d6fa3] shrink-0" />
-                <span className="hidden lg:inline text-[#6e5f4f]">Water</span>
+                <span className="hidden xl:inline text-[#6e5f4f]">Water</span>
                 <strong className="font-semibold text-[#2b221b]">
                   {worldState.resources.water}
                 </strong>
               </span>
 
               <span
-                className="hidden sm:flex items-center gap-1"
-                title="Rich compost for enriching soil"
+                className="hidden md:flex items-center gap-1"
+                title="Rich compost for enriching soil (+25% speed & +1 yield)"
               >
                 <Shovel className="w-3.5 h-3.5 text-[#7a542e] shrink-0" />
-                <span className="hidden lg:inline text-[#6e5f4f]">Compost</span>
+                <span className="hidden xl:inline text-[#6e5f4f]">Compost</span>
                 <strong className="font-semibold text-[#2b221b]">
                   {worldState.resources.compost}
-                </strong>
-              </span>
-
-              <span
-                className="flex items-center gap-1"
-                title="Total harvested crops in basket"
-              >
-                <ShoppingBasket className="w-3.5 h-3.5 text-[#9c631e] shrink-0" />
-                <span className="hidden lg:inline text-[#6e5f4f]">Harvest</span>
-                <strong className="font-semibold text-[#2b221b]">
-                  {worldState.resources.harvestTotal}
                 </strong>
               </span>
             </div>
@@ -625,7 +700,7 @@ export default function App() {
           role="dialog"
           aria-modal="false"
           aria-label="World Menu"
-          className="fixed top-16 left-1/2 -translate-x-1/2 z-40 w-[92vw] max-w-md bg-[#faf5ec] text-[#382f27] rounded-2xl border border-[#dfd3bf] shadow-2xl overflow-hidden"
+          className="fixed top-16 left-1/2 -translate-x-1/2 z-40 w-[94vw] max-w-md bg-[#faf5ec] text-[#382f27] rounded-2xl border border-[#dfd3bf] shadow-2xl overflow-hidden"
         >
           {/* Secondary Menu Header & Tabs */}
           <div className="px-3.5 pt-3 pb-2 border-b border-[#e8dfd0] flex items-center justify-between gap-2">
@@ -637,12 +712,12 @@ export default function App() {
                 [
                   {
                     id: 'inventory',
-                    label: 'Inventory',
+                    label: 'Pantry',
                     icon: <Package className="w-3.5 h-3.5" />,
                   },
                   {
                     id: 'milestones',
-                    label: 'Milestones',
+                    label: 'Progress',
                     icon: <Award className="w-3.5 h-3.5" />,
                   },
                   {
@@ -696,72 +771,184 @@ export default function App() {
           </div>
 
           {/* Tab Content Body */}
-          <div className="p-4 max-h-[68vh] overflow-y-auto">
+          <div className="p-4 max-h-[70vh] overflow-y-auto">
             {menuTab === 'inventory' && (
-              <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-3.5">
+                {/* Summary Row */}
                 <div className="flex items-center justify-between text-xs text-[#695b4c]">
-                  <span>Gathered Pantry & Goods</span>
+                  <span className="font-semibold text-[#2b221b]">
+                    Pantry & Market ({worldState.coins} Coins)
+                  </span>
                   <span className="font-mono-tabular">
-                    {worldState.objectCounts.plots} Plots ·{' '}
+                    {worldState.objectCounts.plots} Beds ·{' '}
                     {worldState.objectCounts.ripePlots} Ripe
                   </span>
                 </div>
 
-                <div className="grid grid-cols-2 gap-2 text-xs font-mono-tabular">
-                  <div className="p-2.5 rounded-xl bg-[#f2eadb] flex items-center justify-between">
-                    <span className="font-sans text-[#4a3f34]">Golden Wheat</span>
-                    <strong className="text-sm font-semibold text-[#2b221b]">
-                      {worldState.inventory.wheat}
-                    </strong>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-[#f2eadb] flex items-center justify-between">
-                    <span className="font-sans text-[#4a3f34]">Pumpkins</span>
-                    <strong className="text-sm font-semibold text-[#2b221b]">
-                      {worldState.inventory.pumpkin}
-                    </strong>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-[#f2eadb] flex items-center justify-between">
-                    <span className="font-sans text-[#4a3f34]">Sweet Berries</span>
-                    <strong className="text-sm font-semibold text-[#2b221b]">
-                      {worldState.inventory.berry}
-                    </strong>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-[#f2eadb] flex items-center justify-between">
-                    <span className="font-sans text-[#4a3f34]">Meadow Honey</span>
-                    <strong className="text-sm font-semibold text-[#2b221b]">
-                      {worldState.inventory.honey}
-                    </strong>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-[#f2eadb] flex items-center justify-between">
-                    <span className="font-sans text-[#4a3f34]">Mill Flour</span>
-                    <strong className="text-sm font-semibold text-[#2b221b]">
-                      {worldState.inventory.flour}
-                    </strong>
-                  </div>
-                  <div className="p-2.5 rounded-xl bg-[#f2eadb] flex items-center justify-between">
-                    <span className="font-sans text-[#4a3f34]">Harmony</span>
-                    <strong className="text-sm font-semibold text-[#2e5926]">
-                      {worldState.happiness}%
-                    </strong>
+                {/* Gathered Goods with Sell Buttons */}
+                <div className="grid grid-cols-1 gap-1.5 text-xs">
+                  {(
+                    [
+                      {
+                        key: 'berry',
+                        label: 'Sweet Berries',
+                        count: worldState.inventory.berry,
+                        price: SELL_PRICES.berry,
+                      },
+                      {
+                        key: 'wheat',
+                        label: 'Golden Wheat',
+                        count: worldState.inventory.wheat,
+                        price: SELL_PRICES.wheat,
+                      },
+                      {
+                        key: 'pumpkin',
+                        label: 'Heirloom Pumpkins',
+                        count: worldState.inventory.pumpkin,
+                        price: SELL_PRICES.pumpkin,
+                      },
+                      {
+                        key: 'honey',
+                        label: 'Meadow Honey',
+                        count: worldState.inventory.honey,
+                        price: SELL_PRICES.honey,
+                      },
+                      {
+                        key: 'flour',
+                        label: 'Mill Flour',
+                        count: worldState.inventory.flour,
+                        price: SELL_PRICES.flour,
+                      },
+                    ] as const
+                  ).map((item) => (
+                    <div
+                      key={item.key}
+                      className="px-3 py-2 rounded-xl bg-[#f2eadb] flex items-center justify-between gap-2"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="text-[#4a3f34] font-medium">
+                          {item.label}
+                        </span>
+                        <strong className="font-mono-tabular text-sm font-semibold text-[#2b221b]">
+                          ×{item.count}
+                        </strong>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={item.count <= 0}
+                        onClick={() =>
+                          controllerRef.current?.sellProduce(item.key, 1)
+                        }
+                        className={`min-h-[30px] px-2.5 py-1 rounded-lg text-[11px] font-semibold font-mono-tabular cursor-pointer ${
+                          item.count > 0
+                            ? 'bg-[#e6d6b8] hover:bg-[#dbc69e] text-[#473314]'
+                            : 'bg-[#e8e0d2] text-[#9e9181] cursor-not-allowed'
+                        }`}
+                      >
+                        Sell 1 (+{item.price}c)
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {totalPantryItems > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => controllerRef.current?.sellAllProduce()}
+                    className="w-full min-h-[38px] px-3 py-1.5 rounded-xl bg-[#f7e8c8] hover:bg-[#f0dcaf] text-[#5c400e] border border-[#dbb872] text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Coins className="w-3.5 h-3.5" />
+                    <span>Sell All Pantry Goods</span>
+                  </button>
+                )}
+
+                {/* Seed Packets & Purchasing */}
+                <div className="pt-2 border-t border-[#e8dfd0] flex flex-col gap-2">
+                  <span className="text-xs font-semibold text-[#2b221b]">
+                    Seed Packets
+                  </span>
+                  <div className="grid grid-cols-3 gap-1.5 text-xs">
+                    {(['berry', 'wheat', 'pumpkin'] as CropType[]).map(
+                      (crop) => {
+                        const cfg = CROP_CONFIG[crop];
+                        const count = worldState.seedsByCrop[crop];
+                        const unlocked = isTierAtLeast(
+                          worldState.progressionTier,
+                          cfg.unlockTier,
+                        );
+                        return (
+                          <div
+                            key={crop}
+                            className="p-2 rounded-xl bg-[#f2eadb] flex flex-col justify-between gap-1.5"
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="font-medium text-[#382f27] capitalize">
+                                {crop}
+                              </span>
+                              <strong className="font-mono-tabular text-[#2b221b]">
+                                {count}
+                              </strong>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={
+                                !unlocked ||
+                                worldState.coins < cfg.seedCoinCost
+                              }
+                              onClick={() =>
+                                controllerRef.current?.buySeed(crop, 1)
+                              }
+                              className={`min-h-[30px] px-2 py-1 rounded-lg text-[11px] font-semibold cursor-pointer ${
+                                unlocked && worldState.coins >= cfg.seedCoinCost
+                                  ? 'bg-[#dff0d8] hover:bg-[#cfe7c5] text-[#23451e] border border-[#a6cfa0]'
+                                  : 'bg-[#e8e0d2] text-[#9e9181] cursor-not-allowed'
+                              }`}
+                            >
+                              {unlocked
+                                ? `Buy (+${cfg.seedCoinCost}c)`
+                                : 'Locked'}
+                            </button>
+                          </div>
+                        );
+                      },
+                    )}
                   </div>
                 </div>
 
+                {/* Compost & Free Fallback */}
                 <div className="pt-2 border-t border-[#e8dfd0] flex flex-col gap-2">
                   <button
                     type="button"
                     onClick={() =>
-                      controllerRef.current?.craftSeedsAndCompost()
+                      controllerRef.current?.craftCompostFromProduce()
                     }
-                    className="w-full min-h-[42px] px-3 py-2 rounded-xl bg-[#dff0d8] hover:bg-[#d0e8c6] text-[#23451e] border border-[#a6cfa0] text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
+                    className="w-full min-h-[38px] px-3 py-1.5 rounded-xl bg-[#ebe0d0] hover:bg-[#dfd0ba] text-[#4d3920] border border-[#bfa684] text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
                   >
-                    <Sprout className="w-4 h-4" />
-                    <span>Prepare +4 Seeds, +3 Compost & +4 Water</span>
+                    <Shovel className="w-3.5 h-3.5" />
+                    <span>
+                      {totalCropProduce >= 2
+                        ? 'Compost 2 Produce → +2 Rich Compost'
+                        : 'Buy +2 Rich Compost (6 Coins)'}
+                    </span>
                   </button>
+
+                  {worldState.canClaimFreeSeeds && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        controllerRef.current?.claimFreeSeedFallback()
+                      }
+                      className="w-full min-h-[38px] px-3 py-1.5 rounded-xl bg-[#dff0d8] hover:bg-[#cfe7c5] text-[#23451e] border border-[#a6cfa0] text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <Sprout className="w-3.5 h-3.5" />
+                      <span>Claim Free Village Berry Seed Packet</span>
+                    </button>
+                  )}
 
                   {/* Quick Inspect Helpers */}
                   <div className="pt-1 flex flex-col gap-1.5">
                     <span className="text-[11px] text-[#7a6b5a]">
-                      Quick Inspect on Planet (or click any object directly)
+                      Quick Inspect on Planet
                     </span>
                     <div className="grid grid-cols-3 gap-1.5">
                       <button
@@ -770,7 +957,7 @@ export default function App() {
                           setMenuOpen(false);
                           controllerRef.current?.selectFirstEntityOfKind('plot');
                         }}
-                        className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-xs font-medium text-[#382f27] cursor-pointer whitespace-nowrap"
+                        className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-xs font-medium text-[#382f27] cursor-pointer whitespace-nowrap"
                       >
                         Inspect Plot
                       </button>
@@ -782,7 +969,7 @@ export default function App() {
                             'building',
                           );
                         }}
-                        className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-xs font-medium text-[#382f27] cursor-pointer whitespace-nowrap"
+                        className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-xs font-medium text-[#382f27] cursor-pointer whitespace-nowrap"
                       >
                         Inspect Mill
                       </button>
@@ -794,7 +981,7 @@ export default function App() {
                             'villager',
                           );
                         }}
-                        className="min-h-[38px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-xs font-medium text-[#382f27] cursor-pointer whitespace-nowrap"
+                        className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-xs font-medium text-[#382f27] cursor-pointer whitespace-nowrap"
                       >
                         Inspect Villager
                       </button>
@@ -805,39 +992,112 @@ export default function App() {
             )}
 
             {menuTab === 'milestones' && (
-              <div className="flex flex-col gap-3">
-                {milestones.map((m) => {
-                  const done = m.current >= m.target;
-                  const pct = Math.min(
-                    100,
-                    Math.round((m.current / m.target) * 100),
-                  );
-                  return (
-                    <div
-                      key={m.id}
-                      className="p-3 rounded-xl bg-[#f2eadb] flex flex-col gap-1.5"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-[#2b221b] flex items-center gap-1.5">
-                          {done && (
-                            <Check className="w-3.5 h-3.5 text-[#2e6924] shrink-0" />
-                          )}
-                          <span>{m.title}</span>
-                        </span>
-                        <span className="text-xs font-mono-tabular text-[#594d40]">
-                          {Math.min(m.current, m.target)} / {m.target}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-[#695b4c]">{m.desc}</p>
-                      <div className="w-full h-1.5 rounded-full bg-[#dfd3bf] overflow-hidden mt-0.5">
+              <div className="flex flex-col gap-3.5">
+                {/* Current Progression Tier Card */}
+                <div className="p-3 rounded-xl bg-[#e6f2e1] border border-[#b5d6ab] flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-[#23451e]">
+                      Tier: {worldState.progressionTierLabel}
+                    </span>
+                    <span className="text-xs font-mono-tabular font-semibold text-[#23451e]">
+                      {worldState.gardenPoints} GP
+                    </span>
+                  </div>
+                  {worldState.nextTierLabel && worldState.nextTierPoints ? (
+                    <>
+                      <p className="text-[11px] text-[#365e30]">
+                        Next tier: <strong>{worldState.nextTierLabel}</strong> at{' '}
+                        {worldState.nextTierPoints} Garden Points
+                      </p>
+                      <div className="w-full h-1.5 rounded-full bg-[#cce3c5] overflow-hidden mt-0.5">
                         <div
-                          className="h-full bg-[#4f8743] rounded-full transition-all duration-300"
-                          style={{ width: `${pct}%` }}
+                          className="h-full bg-[#3f7536] rounded-full transition-all duration-300"
+                          style={{
+                            width: `${Math.min(
+                              100,
+                              Math.round(
+                                (worldState.gardenPoints /
+                                  worldState.nextTierPoints) *
+                                  100,
+                              ),
+                            )}%`,
+                          }}
                         />
                       </div>
-                    </div>
-                  );
-                })}
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-[#365e30]">
+                      Highest sanctuary tier reached! Auto-replant is unlocked.
+                    </p>
+                  )}
+                </div>
+
+                {/* Tier Unlocks Overview */}
+                <div className="grid grid-cols-2 gap-1.5">
+                  {PROGRESSION_TIERS.map((tier) => {
+                    const unlocked = isTierAtLeast(
+                      worldState.progressionTier,
+                      tier.id,
+                    );
+                    return (
+                      <div
+                        key={tier.id}
+                        className={`p-2 rounded-xl border text-[11px] flex flex-col gap-0.5 ${
+                          unlocked
+                            ? 'bg-[#f2eadb] border-[#d8cbb6] text-[#2b221b]'
+                            : 'bg-[#efe9de]/60 border-[#e6dfd3] text-[#8a7c6b]'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between font-semibold">
+                          <span>{tier.title}</span>
+                          <span className="font-mono-tabular">
+                            {tier.requiredPoints} GP
+                          </span>
+                        </div>
+                        <span className="text-[10px] leading-tight opacity-85">
+                          {tier.unlockSummary}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Milestones List */}
+                <div className="flex flex-col gap-2 pt-1">
+                  <span className="text-xs font-semibold text-[#2b221b]">
+                    Sanctuary Milestones
+                  </span>
+                  {MILESTONE_DEFINITIONS.map((m) => {
+                    const done = worldState.completedMilestones.includes(m.id);
+                    return (
+                      <div
+                        key={m.id}
+                        className="p-2.5 rounded-xl bg-[#f2eadb] flex items-center justify-between gap-2"
+                      >
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-xs font-semibold text-[#2b221b] flex items-center gap-1.5">
+                            {done && (
+                              <Check className="w-3.5 h-3.5 text-[#2e6924] shrink-0" />
+                            )}
+                            <span>{m.title}</span>
+                          </span>
+                          <p className="text-[11px] text-[#695b4c]">
+                            {m.description}
+                          </p>
+                        </div>
+                        <span
+                          className={`text-[11px] font-mono-tabular font-semibold px-2 py-0.5 rounded-lg shrink-0 ${
+                            done
+                              ? 'bg-[#dff0d8] text-[#23451e]'
+                              : 'bg-[#e6dccb] text-[#594d40]'
+                          }`}
+                        >
+                          {done ? 'Claimed' : `+${m.rewardGardenPoints} GP`}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
@@ -893,9 +1153,9 @@ export default function App() {
             )}
 
             {menuTab === 'settings' && (
-              <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-3.5">
                 {/* Planet Name */}
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1">
                   <label
                     htmlFor="planet-name-input"
                     className="text-xs font-medium text-[#695b4c]"
@@ -908,12 +1168,9 @@ export default function App() {
                     value={worldState.planetName}
                     maxLength={28}
                     onChange={(e) =>
-                      setWorldState((prev) => ({
-                        ...prev,
-                        planetName: e.target.value,
-                      }))
+                      controllerRef.current?.setPlanetName(e.target.value)
                     }
-                    className="w-full min-h-[40px] px-3 py-1.5 text-sm font-medium bg-[#fffdf9] border border-[#cbbba3] rounded-xl text-[#2b221b] focus:outline-none focus:ring-2 focus:ring-[#a6cfa0]"
+                    className="w-full min-h-[38px] px-3 py-1.5 text-sm font-medium bg-[#fffdf9] border border-[#cbbba3] rounded-xl text-[#2b221b] focus:outline-none focus:ring-2 focus:ring-[#a6cfa0]"
                   />
                 </div>
 
@@ -957,7 +1214,7 @@ export default function App() {
                           key={m.id}
                           type="button"
                           onClick={() => handleSelectTimeMode(m.id)}
-                          className={`min-h-[38px] px-2 py-1.5 text-xs font-medium rounded-xl border flex items-center justify-center gap-1 cursor-pointer ${
+                          className={`min-h-[36px] px-2 py-1 text-xs font-medium rounded-xl border flex items-center justify-center gap-1 cursor-pointer ${
                             active
                               ? 'bg-[#e1ecf7] text-[#264669] border-[#a4c2e3] font-semibold'
                               : 'bg-[#f2eadb] border-transparent text-[#594d40] hover:bg-[#e6dccb]'
@@ -971,7 +1228,55 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Sound & Chimes */}
+                {/* Weather Controls (Natural Cycle + Scenic Overrides) */}
+                <div className="flex flex-col gap-1.5 pt-2 border-t border-[#e8dfd0]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[#695b4c]">
+                      Weather ({seasonLabel})
+                    </span>
+                    {worldState.weatherOverride !== null && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          controllerRef.current?.setWeatherOverride(null)
+                        }
+                        className="text-[11px] font-semibold text-[#2b5c22] hover:underline cursor-pointer"
+                      >
+                        Resume Natural Weather
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {(
+                      [
+                        { id: null, label: 'Natural' },
+                        { id: 'clear', label: 'Clear' },
+                        { id: 'rain', label: 'Rain' },
+                        { id: 'snow', label: 'Snow' },
+                      ] as { id: WeatherPhase | null; label: string }[]
+                    ).map((w) => {
+                      const active = worldState.weatherOverride === w.id;
+                      return (
+                        <button
+                          key={w.label}
+                          type="button"
+                          onClick={() =>
+                            controllerRef.current?.setWeatherOverride(w.id)
+                          }
+                          className={`min-h-[34px] px-2 py-1 text-xs font-medium rounded-xl border cursor-pointer ${
+                            active
+                              ? 'bg-[#dff0d8] text-[#23451e] border-[#a6cfa0] font-semibold'
+                              : 'bg-[#f2eadb] border-transparent text-[#594d40] hover:bg-[#e6dccb]'
+                          }`}
+                        >
+                          {w.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Sound & Ambient Soundscape */}
                 <div className="flex flex-col gap-2 pt-2 border-t border-[#e8dfd0]">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium text-[#4a3f34]">
@@ -984,7 +1289,7 @@ export default function App() {
                         setSoundEnabled(next);
                         soundEngine.setEnabled(next);
                       }}
-                      className={`min-h-[36px] px-3 py-1 rounded-xl text-xs font-medium flex items-center gap-1.5 cursor-pointer ${
+                      className={`min-h-[34px] px-3 py-1 rounded-xl text-xs font-medium flex items-center gap-1.5 cursor-pointer ${
                         soundEnabled
                           ? 'bg-[#dff0d8] text-[#23451e]'
                           : 'bg-[#efe7d8] text-[#695b4c]'
@@ -1001,7 +1306,7 @@ export default function App() {
 
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium text-[#4a3f34]">
-                      Ambient Wind Chimes
+                      Ambient Weather & Chimes
                     </span>
                     <button
                       type="button"
@@ -1009,8 +1314,9 @@ export default function App() {
                         const next = !ambientEnabled;
                         setAmbientEnabled(next);
                         soundEngine.setAmbient(next);
+                        controllerRef.current?.setAmbientAudioEnabled(next);
                       }}
-                      className={`min-h-[36px] px-3 py-1 rounded-xl text-xs font-medium cursor-pointer ${
+                      className={`min-h-[34px] px-3 py-1 rounded-xl text-xs font-medium cursor-pointer ${
                         ambientEnabled
                           ? 'bg-[#dff0d8] text-[#23451e]'
                           : 'bg-[#efe7d8] text-[#695b4c]'
@@ -1020,7 +1326,7 @@ export default function App() {
                     </button>
                   </div>
 
-                  <div className="flex items-center gap-3 pt-1">
+                  <div className="flex items-center gap-3 pt-0.5">
                     <span className="text-xs text-[#695b4c] w-16">Volume</span>
                     <input
                       type="range"
@@ -1032,6 +1338,7 @@ export default function App() {
                         const v = parseFloat(e.target.value);
                         setSoundVolume(v);
                         soundEngine.setVolume(v);
+                        controllerRef.current?.setAmbientAudioVolume(v);
                       }}
                       aria-label="Sound Volume"
                       className="flex-1 accent-[#3f7036]"
@@ -1039,26 +1346,142 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Reduced Motion */}
-                <div className="flex items-center justify-between pt-2 border-t border-[#e8dfd0]">
-                  <span className="text-xs font-medium text-[#4a3f34]">
-                    Reduced Motion
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      controllerRef.current?.setReducedMotion(
-                        !worldState.reducedMotion,
-                      )
-                    }
-                    className={`min-h-[36px] px-3 py-1 rounded-xl text-xs font-medium cursor-pointer ${
-                      worldState.reducedMotion
-                        ? 'bg-[#dff0d8] text-[#23451e]'
-                        : 'bg-[#efe7d8] text-[#695b4c]'
-                    }`}
-                  >
-                    {worldState.reducedMotion ? 'On' : 'Off'}
-                  </button>
+                {/* Automation & Accessibility */}
+                <div className="flex flex-col gap-2 pt-2 border-t border-[#e8dfd0]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[#4a3f34]">
+                      Auto-Replant Harvested Beds
+                    </span>
+                    <button
+                      type="button"
+                      disabled={!worldState.autoReplantUnlocked}
+                      onClick={() =>
+                        controllerRef.current?.setAutoReplantEnabled(
+                          !worldState.autoReplantEnabled,
+                        )
+                      }
+                      className={`min-h-[34px] px-3 py-1 rounded-xl text-xs font-medium cursor-pointer ${
+                        !worldState.autoReplantUnlocked
+                          ? 'bg-[#e8e0d2] text-[#9e9181] cursor-not-allowed'
+                          : worldState.autoReplantEnabled
+                            ? 'bg-[#dff0d8] text-[#23451e]'
+                            : 'bg-[#efe7d8] text-[#695b4c]'
+                      }`}
+                    >
+                      {!worldState.autoReplantUnlocked
+                        ? 'Unlock at 220 GP'
+                        : worldState.autoReplantEnabled
+                          ? 'Enabled'
+                          : 'Off'}
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[#4a3f34]">
+                      Reduced Motion
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        controllerRef.current?.setReducedMotion(
+                          !worldState.reducedMotion,
+                        )
+                      }
+                      className={`min-h-[34px] px-3 py-1 rounded-xl text-xs font-medium cursor-pointer ${
+                        worldState.reducedMotion
+                          ? 'bg-[#dff0d8] text-[#23451e]'
+                          : 'bg-[#efe7d8] text-[#695b4c]'
+                      }`}
+                    >
+                      {worldState.reducedMotion ? 'On' : 'Off'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Local Save & Export/Import */}
+                <div className="flex flex-col gap-2 pt-2 border-t border-[#e8dfd0]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[#695b4c]">
+                      Terrarium Save Data
+                    </span>
+                    {worldState.lastSavedAt && (
+                      <span className="text-[10px] text-[#7a6b5a] font-mono-tabular">
+                        Saved{' '}
+                        {new Date(worldState.lastSavedAt).toLocaleTimeString(
+                          [],
+                          { hour: '2-digit', minute: '2-digit' },
+                        )}
+                      </span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => controllerRef.current?.saveGameManual()}
+                      className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-[#dff0d8] hover:bg-[#cfe7c5] text-[#23451e] border border-[#a6cfa0] text-xs font-semibold flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                      <span>Save</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const json =
+                          controllerRef.current?.exportSaveJson() || '';
+                        setSaveJsonBuffer(json);
+                        setShowSaveTransfer((prev) => !prev);
+                      }}
+                      className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-[#382f27] text-xs font-medium flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Export / Import</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        controllerRef.current?.resetWorldToDefault()
+                      }
+                      className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-[#f7dede] hover:bg-[#f0caca] text-[#692626] text-xs font-medium flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>Reset</span>
+                    </button>
+                  </div>
+
+                  {showSaveTransfer && (
+                    <div className="flex flex-col gap-1.5 pt-1">
+                      <textarea
+                        value={saveJsonBuffer}
+                        onChange={(e) => setSaveJsonBuffer(e.target.value)}
+                        rows={3}
+                        placeholder="Paste exported JSON save data here..."
+                        className="w-full p-2 text-[11px] font-mono bg-[#fffdf9] border border-[#cbbba3] rounded-xl text-[#2b221b]"
+                      />
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (saveJsonBuffer.trim()) {
+                              controllerRef.current?.importSaveJson(
+                                saveJsonBuffer,
+                              );
+                            }
+                          }}
+                          className="flex-1 min-h-[34px] px-3 py-1 rounded-xl bg-[#382f27] text-[#fcf8f0] text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>Load JSON Save</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowSaveTransfer(false)}
+                          className="min-h-[34px] px-3 py-1 rounded-xl bg-[#efe7d8] text-[#594d40] text-xs font-medium cursor-pointer"
+                        >
+                          Hide
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1067,18 +1490,25 @@ export default function App() {
       )}
 
       {/* =====================================================================
-          4. SUBTLE GROUPED HARVEST MESSAGE (Never Separate Pop-Ups)
+          4. SUBTLE GROUPED HARVEST & STATUS BANNER (Never Separate Pop-Ups)
       ===================================================================== */}
-      {harvestSummaryParts.length > 0 && (
+      {(harvestSummaryParts.length > 0 || worldState.statusMessage) && (
         <div
           role="status"
           aria-live="polite"
-          className="fixed top-16 left-1/2 -translate-x-1/2 z-30 pointer-events-none"
+          className="fixed top-16 left-1/2 -translate-x-1/2 z-30 pointer-events-none flex flex-col items-center gap-1.5"
         >
-          <div className="flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-[#2c3b28] text-[#f4faef] border border-[#5b8250] shadow-lg text-xs font-medium whitespace-nowrap">
-            <ShoppingBasket className="w-3.5 h-3.5 text-[#b8e986] shrink-0" />
-            <span>Gathered {harvestSummaryParts.join(' · ')}</span>
-          </div>
+          {harvestSummaryParts.length > 0 && (
+            <div className="flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-[#2c3b28] text-[#f4faef] border border-[#5b8250] shadow-lg text-xs font-medium whitespace-nowrap">
+              <ShoppingBasket className="w-3.5 h-3.5 text-[#b8e986] shrink-0" />
+              <span>Gathered {harvestSummaryParts.join(' · ')}</span>
+            </div>
+          )}
+          {worldState.statusMessage && (
+            <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-2xl bg-[#382f27]/95 text-[#faf5ec] border border-[#6e5f4f] shadow-md text-xs font-medium whitespace-nowrap">
+              <span>{worldState.statusMessage}</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -1096,31 +1526,58 @@ export default function App() {
           >
             {/* A. PLOT SELECTED: Compact Crop-Care Panel */}
             {worldState.selectedEntity.kind === 'plot' && (
-              <div className="flex flex-col gap-3">
+              <div className="flex flex-col gap-2.5">
                 <div className="flex items-start justify-between gap-2">
                   <div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5 flex-wrap">
                       <h2 className="text-sm font-semibold text-[#2b221b]">
-                        {worldState.selectedEntity.cropLabel} Plot
+                        {worldState.selectedEntity.lifecycleState ===
+                          'prepared' ||
+                        worldState.selectedEntity.lifecycleState === 'harvested'
+                          ? worldState.selectedEntity.stage
+                          : `${worldState.selectedEntity.cropLabel} Bed`}
                       </h2>
                       <span className="text-xs text-[#594d40]">
-                        · {worldState.selectedEntity.stage} (
-                        <span className="font-mono-tabular">
-                          {worldState.selectedEntity.growthPct}%
-                        </span>
-                        )
+                        · {worldState.selectedEntity.stage}
+                        {worldState.selectedEntity.lifecycleState !==
+                          'prepared' &&
+                          worldState.selectedEntity.lifecycleState !==
+                            'harvested' && (
+                            <>
+                              {' '}
+                              (
+                              <span className="font-mono-tabular">
+                                {worldState.selectedEntity.growthPct}%
+                              </span>
+                              )
+                            </>
+                          )}
                       </span>
                     </div>
                     <p className="text-xs text-[#695b4c] font-mono-tabular mt-0.5">
                       Moisture {worldState.selectedEntity.moisturePct}%
                       {' · '}
                       {worldState.selectedEntity.composted
-                        ? 'Enriched Compost (2x Yield)'
+                        ? 'Enriched Soil (+25% speed, +1 yield)'
                         : 'Standard Soil'}
                       {worldState.selectedEntity.pollinated
                         ? ' · Bee Pollinated'
                         : ''}
+                      {worldState.selectedEntity.hasCloche
+                        ? ' · Glass Cloche'
+                        : ''}
                     </p>
+                    {(worldState.selectedEntity.pausedByCold ||
+                      worldState.selectedEntity.reservedByVillagerName) && (
+                      <p className="text-[11px] text-[#8c5828] mt-0.5">
+                        {worldState.selectedEntity.pausedByCold
+                          ? 'Winter frost: fit a Glass Cloche to keep growing in snow. '
+                          : ''}
+                        {worldState.selectedEntity.reservedByVillagerName
+                          ? `${worldState.selectedEntity.reservedByVillagerName} is tending this bed.`
+                          : ''}
+                      </p>
+                    )}
                   </div>
 
                   <button
@@ -1143,6 +1600,47 @@ export default function App() {
                   />
                 </div>
 
+                {/* If Prepared or Harvested: Show Sow Seed Buttons */}
+                {(worldState.selectedEntity.lifecycleState === 'prepared' ||
+                  worldState.selectedEntity.lifecycleState === 'harvested') && (
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(['berry', 'wheat', 'pumpkin'] as CropType[]).map(
+                      (crop) => {
+                        const cfg = CROP_CONFIG[crop];
+                        const unlocked = isTierAtLeast(
+                          worldState.progressionTier,
+                          cfg.unlockTier,
+                        );
+                        const packetCount = worldState.seedsByCrop[crop];
+                        return (
+                          <button
+                            key={crop}
+                            type="button"
+                            disabled={!unlocked}
+                            onClick={() =>
+                              worldState.selectedEntity?.kind === 'plot' &&
+                              controllerRef.current?.replantPlot(
+                                worldState.selectedEntity.id,
+                                crop,
+                              )
+                            }
+                            className={`min-h-[38px] px-2 py-1.5 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap ${
+                              unlocked
+                                ? 'bg-[#dff0d8] hover:bg-[#cfe7c5] text-[#23451e] border-[#a6cfa0]'
+                                : 'bg-[#e8e0d2] border-transparent text-[#9e9181] cursor-not-allowed'
+                            }`}
+                          >
+                            <Sprout className="w-3.5 h-3.5 shrink-0" />
+                            <span className="capitalize">
+                              Sow {crop} ({packetCount})
+                            </span>
+                          </button>
+                        );
+                      },
+                    )}
+                  </div>
+                )}
+
                 {/* Crop-Care Actions */}
                 <div className="grid grid-cols-4 gap-1.5">
                   <button
@@ -1153,7 +1651,7 @@ export default function App() {
                         worldState.selectedEntity.id,
                       )
                     }
-                    className="min-h-[42px] px-2.5 py-1.5 rounded-xl bg-[#d9eef7] hover:bg-[#c6e4f2] text-[#1b4c66] border border-[#91c4de] text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    className="min-h-[40px] px-2.5 py-1.5 rounded-xl bg-[#d9eef7] hover:bg-[#c6e4f2] text-[#1b4c66] border border-[#91c4de] text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
                   >
                     <Droplets className="w-3.5 h-3.5 shrink-0" />
                     <span>Water</span>
@@ -1161,27 +1659,43 @@ export default function App() {
 
                   <button
                     type="button"
+                    disabled={worldState.selectedEntity.composted}
                     onClick={() =>
                       worldState.selectedEntity?.kind === 'plot' &&
                       controllerRef.current?.compostPlot(
                         worldState.selectedEntity.id,
                       )
                     }
-                    className="min-h-[42px] px-2.5 py-1.5 rounded-xl bg-[#ebe0d0] hover:bg-[#dfd0ba] text-[#4d3920] border border-[#bfa684] text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    className={`min-h-[40px] px-2.5 py-1.5 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap ${
+                      worldState.selectedEntity.composted
+                        ? 'bg-[#e8e0d2] border-transparent text-[#9e9181] cursor-not-allowed'
+                        : 'bg-[#ebe0d0] hover:bg-[#dfd0ba] text-[#4d3920] border-[#bfa684] cursor-pointer'
+                    }`}
                   >
                     <Shovel className="w-3.5 h-3.5 shrink-0" />
-                    <span>Compost</span>
+                    <span>
+                      {worldState.selectedEntity.composted
+                        ? 'Enriched'
+                        : 'Compost'}
+                    </span>
                   </button>
 
                   <button
                     type="button"
+                    disabled={
+                      worldState.selectedEntity.lifecycleState !== 'ripe'
+                    }
                     onClick={() =>
                       worldState.selectedEntity?.kind === 'plot' &&
                       controllerRef.current?.harvestPlot(
                         worldState.selectedEntity.id,
                       )
                     }
-                    className="min-h-[42px] px-2.5 py-1.5 rounded-xl bg-[#f7e8c8] hover:bg-[#f0dcaf] text-[#5c400e] border border-[#dbb872] text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    className={`min-h-[40px] px-2.5 py-1.5 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap ${
+                      worldState.selectedEntity.lifecycleState === 'ripe'
+                        ? 'bg-[#f7e8c8] hover:bg-[#f0dcaf] text-[#5c400e] border-[#dbb872] cursor-pointer'
+                        : 'bg-[#e8e0d2] border-transparent text-[#9e9181] cursor-not-allowed'
+                    }`}
                   >
                     <ShoppingBasket className="w-3.5 h-3.5 shrink-0" />
                     <span>Harvest</span>
@@ -1189,24 +1703,35 @@ export default function App() {
 
                   <button
                     type="button"
-                    onClick={() => {
-                      if (worldState.selectedEntity?.kind !== 'plot') return;
-                      const order: CropType[] = ['wheat', 'pumpkin', 'berry'];
-                      const nextCrop =
-                        order[
-                          (order.indexOf(worldState.selectedEntity.cropType) +
-                            1) %
-                            order.length
-                        ];
-                      controllerRef.current?.replantPlot(
+                    disabled={
+                      worldState.selectedEntity.hasCloche ||
+                      !isTierAtLeast(
+                        worldState.progressionTier,
+                        'flourishing_terrarium',
+                      )
+                    }
+                    onClick={() =>
+                      worldState.selectedEntity?.kind === 'plot' &&
+                      controllerRef.current?.installClocheOnPlot(
                         worldState.selectedEntity.id,
-                        nextCrop,
-                      );
-                    }}
-                    className="min-h-[42px] px-2.5 py-1.5 rounded-xl bg-[#f0e8da] hover:bg-[#e4dac8] text-[#4a3f34] border border-[#dcd0bc] text-xs font-medium flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap"
+                      )
+                    }
+                    className={`min-h-[40px] px-2 py-1.5 rounded-xl border text-xs font-medium flex items-center justify-center gap-1 whitespace-nowrap ${
+                      worldState.selectedEntity.hasCloche ||
+                      !isTierAtLeast(
+                        worldState.progressionTier,
+                        'flourishing_terrarium',
+                      )
+                        ? 'bg-[#e8e0d2] border-transparent text-[#9e9181] cursor-not-allowed'
+                        : 'bg-[#e0f2f1] hover:bg-[#cce8e6] text-[#195752] border-[#99d1cc] cursor-pointer'
+                    }`}
                   >
-                    <Sprout className="w-3.5 h-3.5 shrink-0" />
-                    <span>Replant</span>
+                    <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                    <span>
+                      {worldState.selectedEntity.hasCloche
+                        ? 'Cloche On'
+                        : 'Cloche'}
+                    </span>
                   </button>
                 </div>
               </div>
@@ -1240,16 +1765,33 @@ export default function App() {
                   </button>
                 </div>
 
+                {typeof worldState.selectedEntity.productionProgress ===
+                  'number' && (
+                  <div className="w-full h-1.5 rounded-full bg-[#e6dccb] overflow-hidden">
+                    <div
+                      className="h-full bg-[#c78826] rounded-full transition-all duration-300"
+                      style={{
+                        width: `${worldState.selectedEntity.productionProgress}%`,
+                      }}
+                    />
+                  </div>
+                )}
+
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    disabled={!worldState.selectedEntity.canPerformAction}
                     onClick={() =>
                       worldState.selectedEntity?.kind === 'building' &&
                       controllerRef.current?.performBuildingAction(
                         worldState.selectedEntity.id,
                       )
                     }
-                    className="flex-1 min-h-[42px] px-3 py-2 rounded-xl bg-[#dff0d8] hover:bg-[#cfe7c5] text-[#23451e] border border-[#a6cfa0] text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer whitespace-nowrap"
+                    className={`flex-1 min-h-[42px] px-3 py-2 rounded-xl border text-xs font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap ${
+                      worldState.selectedEntity.canPerformAction
+                        ? 'bg-[#dff0d8] hover:bg-[#cfe7c5] text-[#23451e] border-[#a6cfa0] cursor-pointer'
+                        : 'bg-[#e8e0d2] border-transparent text-[#8c7f70] cursor-not-allowed'
+                    }`}
                   >
                     <Sparkles className="w-3.5 h-3.5 shrink-0" />
                     <span>{worldState.selectedEntity.actionLabel}</span>
@@ -1294,7 +1836,7 @@ export default function App() {
                         · {worldState.selectedEntity.role}
                       </span>
                     </div>
-                    <p className="text-xs text-[#695b4c] mt-0.5">
+                    <p className="text-xs text-[#2e5926] font-medium mt-0.5">
                       {worldState.selectedEntity.activity}
                     </p>
                   </div>
@@ -1414,25 +1956,41 @@ export default function App() {
               <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5">
                 {trayTools.map((tool) => {
                   const isSelected = worldState.activeTool === tool.id;
+                  const unlocked = isTierAtLeast(
+                    worldState.progressionTier,
+                    tool.requiredTier,
+                  );
                   return (
                     <button
                       key={tool.id}
                       type="button"
                       onClick={() => handleSelectTool(tool.id)}
-                      title={tool.description}
+                      title={
+                        unlocked
+                          ? tool.description
+                          : `Unlocks at ${getTierTitle(tool.requiredTier)}`
+                      }
                       className={`min-h-[48px] px-3 py-2 rounded-xl border flex items-center gap-2 shrink-0 cursor-pointer ${transitionClass} ${
-                        isSelected
-                          ? `${tool.accentBg} ${tool.accentBorder} ${tool.accentText} font-semibold shadow-xs`
-                          : 'bg-[#f2eadb] border-[#e2d6c3] text-[#4a3f34] hover:bg-[#e8decb] hover:text-[#2b221b]'
+                        !unlocked
+                          ? 'bg-[#efe9de] border-[#e2d9c8] text-[#8c7f70] opacity-80'
+                          : isSelected
+                            ? `${tool.accentBg} ${tool.accentBorder} ${tool.accentText} font-semibold shadow-xs`
+                            : 'bg-[#f2eadb] border-[#e2d6c3] text-[#4a3f34] hover:bg-[#e8decb] hover:text-[#2b221b]'
                       }`}
                     >
-                      {renderToolIcon(tool.id)}
+                      {unlocked ? (
+                        renderToolIcon(tool.id)
+                      ) : (
+                        <Lock className="w-3.5 h-3.5 shrink-0 text-[#8c7f70]" />
+                      )}
                       <div className="flex flex-col items-start text-left">
                         <span className="text-xs font-medium leading-tight whitespace-nowrap">
                           {tool.shortLabel}
                         </span>
-                        <span className="text-[10px] opacity-75 leading-tight whitespace-nowrap">
-                          {tool.instantAction ? 'Instant' : 'Select'}
+                        <span className="text-[10px] opacity-75 leading-tight whitespace-nowrap font-mono-tabular">
+                          {unlocked
+                            ? getToolSubLabel(tool.id, tool.instantAction)
+                            : getTierTitle(tool.requiredTier)}
                         </span>
                       </div>
                     </button>
@@ -1459,7 +2017,7 @@ export default function App() {
                     {activeToolDef.label} Active
                   </div>
                   <div className="text-[11px] text-[#695b4c] truncate">
-                    Click planet surface to apply
+                    {activeToolDef.description}
                   </div>
                 </div>
               </div>

@@ -24,8 +24,11 @@ export type PlacedObjectType =
 export interface GardenPlotParts {
   soilMat: THREE.MeshStandardMaterial;
   compostGroup: THREE.Group;
+  seedDotsGroup: THREE.Group;
   sproutsGroup: THREE.Group;
   matureGroup: THREE.Group;
+  harvestedStubbleGroup: THREE.Group;
+  clocheGroup: THREE.Group;
 }
 
 export interface PlacedObjectEntity {
@@ -41,10 +44,18 @@ export interface PlacedObjectEntity {
   bounceActive: boolean;
   // Garden plot specific state
   cropType?: CropType;
+  hasCrop?: boolean;
+  harvested?: boolean;
+  hasCloche?: boolean;
+  reservedByVillagerId?: string | null;
   moisture?: number; // 0..1
   composted?: boolean;
   plotParts?: GardenPlotParts;
   customTitle?: string;
+  // Building production state (Windmill, Beehive)
+  isProcessing?: boolean;
+  productionTimer?: number;
+  storedOutput?: number;
   // Dynamic parts for animation
   windmillRotor?: THREE.Object3D;
   lighthouseBeamPivot?: THREE.Object3D;
@@ -81,6 +92,10 @@ export interface VillagerEntity {
   yaw: number;
   stuckTimer?: number;
   steerSign?: number;
+  taskKind?: 'idle' | 'watering_plot' | 'replanting_plot' | 'tending_mill' | 'tending_hive';
+  taskTargetId?: string | null;
+  workTimer?: number;
+  liveActivityLabel?: string;
 }
 
 export interface SheepEntity {
@@ -4404,13 +4419,103 @@ export function createGardenPlotMesh(cropType: CropType): {
 
   group.add(matureGroup);
 
+  // 6. Sown seed markers (visible in 'sown' stage before seedling sprouts)
+  const seedDotsGroup = new THREE.Group();
+  const seedMat = new THREE.MeshStandardMaterial({
+    color:
+      cropType === 'wheat'
+        ? '#e8c86b'
+        : cropType === 'pumpkin'
+          ? '#f2dec2'
+          : '#c95b72',
+    roughness: 0.65,
+    flatShading: true,
+  });
+  for (let r = -1; r <= 1; r++) {
+    for (let c = -1; c <= 1; c++) {
+      const pip = new THREE.Mesh(
+        new THREE.SphereGeometry(0.0019, 5, 5),
+        seedMat,
+      );
+      pip.scale.set(1.2, 0.7, 1.0);
+      pip.position.set(c * 0.013, 0.0085, r * 0.0135);
+      seedDotsGroup.add(pip);
+    }
+  }
+  seedDotsGroup.visible = false;
+  group.add(seedDotsGroup);
+
+  // 7. Harvested stubble / resting bed markers (visible in 'harvested' stage)
+  const harvestedStubbleGroup = new THREE.Group();
+  const stubbleMat = new THREE.MeshStandardMaterial({
+    color: '#9e8256',
+    roughness: 0.88,
+    flatShading: true,
+  });
+  for (let r = -1; r <= 1; r++) {
+    for (let c = -1; c <= 1; c++) {
+      const stub = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.0015, 0.0022, 0.0045, 5),
+        stubbleMat,
+      );
+      stub.position.set(c * 0.013, 0.0082, r * 0.0135);
+      harvestedStubbleGroup.add(stub);
+    }
+  }
+  harvestedStubbleGroup.visible = false;
+  group.add(harvestedStubbleGroup);
+
+  // 8. Miniature Glass Cloche Dome (protects crops during winter / snow)
+  const clocheGroup = new THREE.Group();
+  const clocheGlassMat = new THREE.MeshStandardMaterial({
+    color: '#dff4fa',
+    roughness: 0.18,
+    metalness: 0.05,
+    transparent: true,
+    opacity: 0.36,
+    depthWrite: false,
+  });
+  const clocheRimMat = new THREE.MeshStandardMaterial({
+    color: '#c89d54',
+    roughness: 0.42,
+    metalness: 0.55,
+  });
+  const dome = new THREE.Mesh(
+    new THREE.SphereGeometry(0.025, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.52),
+    clocheGlassMat,
+  );
+  dome.position.y = 0.008;
+  dome.renderOrder = 5;
+  clocheGroup.add(dome);
+
+  const rim = new THREE.Mesh(
+    new THREE.TorusGeometry(0.0245, 0.0014, 6, 16),
+    clocheRimMat,
+  );
+  rim.rotation.x = Math.PI / 2;
+  rim.position.y = 0.0085;
+  clocheGroup.add(rim);
+
+  const handleKnob = new THREE.Mesh(
+    new THREE.SphereGeometry(0.0032, 8, 8),
+    clocheRimMat,
+  );
+  handleKnob.position.y = 0.034;
+  clocheGroup.add(handleKnob);
+
+  clocheGroup.visible = false;
+  group.add(clocheGroup);
+
   return {
     group,
     parts: {
       soilMat,
       compostGroup,
+      seedDotsGroup,
       sproutsGroup,
       matureGroup,
+      harvestedStubbleGroup,
+      clocheGroup,
     },
   };
 }
